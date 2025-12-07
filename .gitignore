@@ -1,0 +1,53 @@
+# ===========================================
+# Python Build / Runtime Files
+# ===========================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+env/
+venv/
+
+# ===========================================
+# Sensitive Email Samples (DO NOT COMMIT)
+# ===========================================
+*.eml
+*.msg
+*.pst
+*.mbox
+*email*.txt
+*samples*.txt
+test-emails/
+email_samples/
+samples/
+headers/
+raw_headers/
+*.headers
+*.email
+
+# ===========================================
+# Editor / OS Noise
+# ===========================================
+.DS_Store
+Thumbs.db
+
+# ===========================================
+# VS Code
+# ===========================================
+.vscode/
+.code-workspace
+
+# ===========================================
+# Logs
+# ===========================================
+*.log
+logs/
+
+# ===========================================
+# Virtual environment + Package build artifacts
+# ===========================================
+build/
+dist/
+*.egg-info/
