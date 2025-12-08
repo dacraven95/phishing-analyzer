@@ -46,7 +46,7 @@ Flags mismatches that often occur in phishing emails.
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/phish-analyzer.git
+git clone https://github.com/dacraven95/phishing-analyzer.git
 cd phish-analyzer
 ```
 
