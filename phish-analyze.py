@@ -98,7 +98,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.2.2
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.2.3
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -551,57 +551,60 @@ def main():
         print()
         msg = parse_full_eml(filename)
 
-        # Extract Email Body
-        plain_body, html_body = extract_bodies(msg)
-
-        # Extract URLs
-        found_URLS = extract_urls_from_body(plain_body, html_body)
-
-        url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
-
-        if plain_body:
-            print(YELLOW + "\n=== Plain text body (first 400 chars) ===" + RESET)
-            print(plain_body[:400])
-        elif html_body:
-            print(YELLOW + "\n=== HTML body (first 400 chars) ===" + RESET)
-            print(html_body[:400])
-        else:
-            print(RED + "\n[!] No body content found in this message." + RESET)
-
-        if found_URLS:
-            print(CYAN + "\n=== URLs Found in Body ===" + RESET)
-            for url in found_URLS:
-                print(" -", url)
-
-            # Flag IP-literal URLs
-            ip_literal_URLS = [u for u in found_URLS if is_ip_literal_url(u)]
-            if ip_literal_URLS:
-                print(RED + "\n[!] IP-literal URLs detected:" + RESET)
-                for url in ip_literal_URLS:
-                    print("   -", url)
-
-            if url_analysis:
-                print(CYAN + "\n=== URL Analysis ===" + RESET)
-                for item in url_analysis:
-                    url = item["url"]
-                    flags = item["flags"]
-                    if flags:
-                        print(f" - {url}")
-                        print(f"   Flags: {', '.join(flags)}")
-                    else:
-                        print(f" - {url}")
-                        print("   Flags: (none)")
-            
-        else:
-            print(YELLOW + "\n[*] No URLs found in body." + RESET)
-        
-        print()
+        # Where it was before
 
     else:
         # Handle as TXT file
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
         msg = parse_headers_from_file(filename)
+
+
+    # Extract Email Body
+    plain_body, html_body = extract_bodies(msg)
+
+    # Extract URLs
+    found_URLS = extract_urls_from_body(plain_body, html_body)
+
+    url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
+
+    if plain_body:
+        print(YELLOW + "\n=== Plain text body (first 400 chars) ===" + RESET)
+        print(plain_body[:400])
+    elif html_body:
+        print(YELLOW + "\n=== HTML body (first 400 chars) ===" + RESET)
+        print(html_body[:400])
+    else:
+        print(RED + "\n[!] No body content found in this message." + RESET)
+
+    if found_URLS:
+        print(CYAN + "\n=== URLs Found in Body ===" + RESET)
+        for url in found_URLS:
+            print(" -", url)
+
+        # Flag IP-literal URLs
+        ip_literal_URLS = [u for u in found_URLS if is_ip_literal_url(u)]
+        if ip_literal_URLS:
+            print(RED + "\n[!] IP-literal URLs detected:" + RESET)
+            for url in ip_literal_URLS:
+                print("   -", url)
+
+        if url_analysis:
+            print(CYAN + "\n=== URL Analysis ===" + RESET)
+            for item in url_analysis:
+                url = item["url"]
+                flags = item["flags"]
+                if flags:
+                    print(f" - {url}")
+                    print(f"   Flags: {', '.join(flags)}")
+                else:
+                    print(f" - {url}")
+                    print("   Flags: (none)")
+        
+    else:
+        print(YELLOW + "\n[*] No URLs found in body." + RESET)
+    
+    print()
 
     from_hdr = msg["From"]
     to_hdr = msg["To"]
