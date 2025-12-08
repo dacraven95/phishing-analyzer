@@ -58,7 +58,7 @@ source venv/bin/activate   # macOS/Linux
 venv\Scripts\activate      # Windows
 ```
 
-The tool uses a few dependencies which can be installed from the pyproject.toml file by running:
+The tool uses a few dependencies which can be installed from the `pyproject.toml` file by running:
 ```bash
 pip install .
 ```
