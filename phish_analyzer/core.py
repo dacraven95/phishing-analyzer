@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 
-# --------------------------------------------------------
-# ORIGINAL SINGLE FILE SCRIPT BEFORE CLI/API SEPARATION
-# --------------------------------------------------------
-
 import os
 import argparse
 import re
@@ -583,6 +579,9 @@ def extract_dns_records(domain: str):
     return output
 
 def run_analysis(file_path: str, use_json: bool = False):
+
+    print_banner()
+
     analysis_results = []
 
     # Get file extension
@@ -841,9 +840,18 @@ def run_analysis(file_path: str, use_json: bool = False):
     if use_json:
         print("\nJSON analysis results:")
         print(json.dumps({"analysis_results": analysis_results}, indent=2))
+    
+    print(rf"""{BRIGHT_GREEN}
+===============================================================================
+   Analysis Complete: Please perform manual investigation to verify findings
+===============================================================================
+{RESET}
+""")
 
 def main():
     
+    print_banner()
+
     parser = argparse.ArgumentParser(
         description="Step 1: just parse and print basic email headers."
     )
@@ -871,6 +879,13 @@ def main():
     run_analysis(args.file, use_json=args.json)
     # result_text = run_analysis_capture_text(args.file, use_json=True)
     # print(result_text)
+
+    print(rf"""{BRIGHT_GREEN}
+===============================================================================
+   Analysis Complete: Please perform manual investigation to verify findings
+===============================================================================
+{RESET}
+""")
     
 
 def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi: bool = True) -> str:
@@ -891,12 +906,11 @@ def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi
 
 # Run main
 if __name__ == "__main__":
-    print_banner()
+    # print_banner()
     main()
-
-    print(rf"""{BRIGHT_GREEN}
-===============================================================================
-   Analysis Complete: Please perform manual investigation to verify findings
-===============================================================================
-{RESET}
-""")
+#     print(rf"""{BRIGHT_GREEN}
+# ===============================================================================
+#    Analysis Complete: Please perform manual investigation to verify findings
+# ===============================================================================
+# {RESET}
+# """)

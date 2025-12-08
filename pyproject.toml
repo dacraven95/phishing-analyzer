@@ -1,0 +1,22 @@
+[project]
+name = "phish-analyzer"
+version = "0.3.0"
+description = "Email phishing analysis tool"
+authors = [
+    { name="DC", email="dacraven95@gmail.com" }
+]
+requires-python = ">=3.10"
+
+dependencies = [
+    "dnspython>=2.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.7",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["phish_analyzer"]

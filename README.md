@@ -52,13 +52,16 @@ cd phish-analyzer
 
 (Optional) Create a virtual environment:
 
-```
+```bash
 python -m venv venv
 source venv/bin/activate   # macOS/Linux
 venv\Scripts\activate      # Windows
 ```
 
-The tool uses currently only Python's standard library - no dependencies required.
+The tool uses a few dependencies which can be installed from the pyproject.toml file by running:
+```bash
+pip install .
+```
 
 ---
 
@@ -66,11 +69,11 @@ The tool uses currently only Python's standard library - no dependencies require
 
 ### Analyze a file (header txt or eml)
 
-```
+```bash
 python phish-analyze.py -f email_headers.txt
 ```
 Or:
-```
+```bash
 python phish-analyze.py -f sample.eml
 ```
 
@@ -93,7 +96,7 @@ Reply-To domain:    marketing-platform.com
 Return-Path domain: mailer.sendgrid.net
 
 SPF Result:         fail
-Client IP:          74.120.121.159
+Client IP:          192.168.1.1
 
 CrossTenant:        True
 ```
@@ -104,11 +107,12 @@ CrossTenant:        True
 
 ### 🔜 Coming Soon
 
-* HTML + text body extraction
-* URL detection & domain reputation heuristics
+* HTML + text body extraction - COMPLETE
+* URL detection - COMPLETE
+* Domain reputation heuristics - IN PROGRESS
 * Suspicious content rule engine
 * LLM-based tone/intent scoring
-* FastAPI REST API endpoint
+* FastAPI REST API endpoint - IN PROGRESS
 * Full risk scoring engine (0–100)
 * JSON output mode
 
