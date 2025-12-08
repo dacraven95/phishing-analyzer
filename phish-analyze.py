@@ -3,13 +3,68 @@
 import os
 import argparse
 import re
+import ipaddress
+import json
+
 from email import message_from_string
 from email.policy import default as default_policy
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
-import ipaddress
 from colors import RED, GREEN, YELLOW, BLUE, RESET, CYAN, BRIGHT_GREEN, MAGENTA, BRIGHT_RED
+from enum import Enum
+
+class Category(str, Enum):
+    HEADERS = "headers"
+    SPF = "spf"
+    DKIM = "dkim"
+    DMARC = "dmarc"
+    AUTH_RESULTS = "auth_results"
+    URLs = "urls"
+    BODY = "body"
+    CONTENT = "content"
+    METADATA = "metadata"
+    GENERAL = "general"
+
+class Severity(str, Enum):
+    INFO = "info"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+class Code(str, Enum):
+    # SPF
+    SPF_STATUS = "SPF_STATUS"
+    SPF_PASS = "SPF_PASS"
+    SPF_FAIL = "SPF_FAIL"
+    SPF_SOFTFAIL = "SPF_SOFTFAIL"
+    SPF_NONE = "SPF_NONE"
+
+    # DKIM
+    DKIM_STATUS = "DKIM_STATUS"
+    DKIM_PASS = "DKIM_PASS"
+    DKIM_FAIL = "DKIM_FAIL"
+    DKIM_MISSING = "DKIM_MISSING"
+
+    # DMARC
+    DMARC_STATUS = "DMARC_STATUS"
+    DMARC_PASS = "DMARC_PASS"
+    DMARC_FAIL = "DMARC_FAIL"
+    DMARC_NONE = "DMARC_NONE"
+
+    # URL-related
+    URL_IP_LITERAL = "URL_IP_LITERAL"
+    URL_SUSPICIOUS_TLD = "URL_SUSPICIOUS_TLD"
+    URL_PUNYCODE = "URL_PUNYCODE"
+    URL_BRAND_IMPERSONATION = "URL_BRAND_IMPERSONATION"
+    URL_OBFUSCATED_PATH = "URL_OBFUSCATED_PATH"
+    URL_SUSPICIOUS_PATH = "URL_SUSPICIOUS_PATH"
+
+    # Headers
+    CROSSTENANT_PRESENT = "CROSSTENANT_PRESENT"
+    FROM_REPLYTO_MISMATCH = "FROM_REPLYTO_MISMATCH"
+    FROM_RETURNPATH_MISMATCH = "FROM_RETURNPATH_MISMATCH"
 
 URL_REGEX = re.compile(
     r'(?i)\b((?:https?://|www\.)[^\s<>"]+)', 
@@ -42,11 +97,23 @@ TRUSTED_BRAND_DOMAINS = {
 
 def print_banner():
     banner = r"""
-==========================================================
-   PHISH ANALYZER - Email Header Scanner - Version: 0.2
-==========================================================
+===================================================================
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.2.2
+===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
+
+def add_finding(results_list, category: Category, code: Code, severity: Severity, message: str, **data):
+    """
+    Append a standardized finding object into the shared analysis_results list.
+    """
+    results_list.append({
+        "category": category.value,
+        "code": code.value,
+        "severity": severity.value,
+        "message": message,
+        "data": data or None,
+    })
 
 class HrefExtractor(HTMLParser):
     def __init__(self):
@@ -252,7 +319,7 @@ def looks_random_segment(segment: str) -> bool:
     vowels = sum(1 for c in segment.lower() if c in "aeiou")
     return vowels / len(segment) < 0.2
 
-def analyze_url(url: str) -> dict:
+def analyze_url(url: str, analysis_results) -> dict:
     """
     Analyze a single normalized URL and return:
     {
@@ -269,6 +336,14 @@ def analyze_url(url: str) -> dict:
     # 1) IP-literal
     if is_ip_literal_url(url):
         flags.append("IP_LITERAL")
+        add_finding(
+            analysis_results,
+            category=Category.URLs,
+            code=Code.URL_IP_LITERAL,
+            severity=Severity.HIGH,
+            message=f"URL host is a literal IP: {url}",
+            url=url,
+        )
 
     # 2) Suspicious TLD
     # crude: last label after the final dot
@@ -276,10 +351,26 @@ def analyze_url(url: str) -> dict:
     tld = parts[-1] if len(parts) > 1 else ""
     if tld in SUSPICIOUS_TLDS:
         flags.append("SUSPICIOUS_TLD")
+        add_finding(
+            analysis_results,
+            category=Category.URLs,
+            code=Code.URL_SUSPICIOUS_TLD,
+            severity=Severity.HIGH,
+            message=f"URL host has a suspicious tld: {url}",
+            url=url,
+        )
 
     # 3) Punycode / IDN
     if "xn--" in domain:
         flags.append("PUNYCODE_DOMAIN")
+        add_finding(
+            analysis_results,
+            category=Category.URLs,
+            code=Code.URL_PUNYCODE,
+            severity=Severity.HIGH,
+            message=f"URL has a punycode domain: {url}",
+            url=url,
+        )
 
     # 4) HTTP (no HTTPS)
     if parsed.scheme == "http":
@@ -292,12 +383,28 @@ def analyze_url(url: str) -> dict:
         if kw in path_lower or kw in query_lower:
             flags.append(f"KEYWORD_{kw.upper()}")
             # don't break; we want all hits
+            add_finding(
+                analysis_results,
+                category=Category.URLs,
+                code=Code.URL_SUSPICIOUS_PATH,
+                severity=Severity.HIGH,
+                message=f"URL has suspicous path keywords: {url}",
+                url=url,
+            )
 
     # 6) Random-looking path segments
     segments = [seg for seg in parsed.path.split("/") if seg]
     randomish_count = sum(1 for seg in segments if looks_random_segment(seg))
     if randomish_count >= 2:
         flags.append("OBFUSCATED_PATH")
+        add_finding(
+            analysis_results,
+            category=Category.URLs,
+            code=Code.URL_OBFUSCATED_PATH,
+            severity=Severity.HIGH,
+            message=f"URL has obfuscated path: {url}",
+            url=url,
+        )
 
     # 7) Brand impersonation-ish
     for brand in BRAND_KEYWORDS:
@@ -305,6 +412,14 @@ def analyze_url(url: str) -> dict:
             trusted = TRUSTED_BRAND_DOMAINS.get(brand, set())
             if domain not in trusted:
                 flags.append(f"BRAND_IMPERSONATION_{brand.upper()}")
+                add_finding(
+                    analysis_results,
+                    category=Category.URLs,
+                    code=Code.URL_BRAND_IMPERSONATION,
+                    severity=Severity.HIGH,
+                    message=f"URL may be attempting brand impersonation: {url}",
+                    url=url,
+                )
             break
 
     return {
@@ -374,6 +489,26 @@ def parse_received_spf(spf_header: str):
         "client_ip": client_ip
     }
 
+def parse_auth_results_header(header_value: str) -> dict:
+    """
+    Parse an Authentication-Results header and extract spf/dkim/dmarc results.
+
+    Returns dict like:
+    {
+        "spf": "pass",
+        "dkim": "pass",
+        "dmarc": "bestguesspass",
+    }
+    """
+    results = {}
+    # Look for "spf=pass", "dkim=fail", "dmarc=bestguesspass", etc.
+    pattern = re.compile(r'\b(spf|dkim|dmarc)\s*=\s*([a-zA-Z0-9_-]+)', re.IGNORECASE)
+
+    for mech, status in pattern.findall(header_value):
+        results[mech.lower()] = status.lower()
+
+    return results
+
 def has_crosstenant_headers(headers: dict) -> bool:
     """
     Returns True if any header name or value contains 'crosstenant'
@@ -385,6 +520,8 @@ def has_crosstenant_headers(headers: dict) -> bool:
     return False
 
 def main():
+    analysis_results = []
+
     parser = argparse.ArgumentParser(
         description="Step 1: just parse and print basic email headers."
     )
@@ -393,6 +530,12 @@ def main():
         "-f", "--file",
         required=True,
         help="Path to a text file containing raw email headers.",
+    )
+
+    parser.add_argument(
+        "-j", "--json",
+        action="store_true",
+        help="Include output of analysis_results as JSON"
     )
 
     args = parser.parse_args()
@@ -414,7 +557,7 @@ def main():
         # Extract URLs
         found_URLS = extract_urls_from_body(plain_body, html_body)
 
-        url_analysis = [analyze_url(u) for u in found_URLS]
+        url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
 
         if plain_body:
             print(YELLOW + "\n=== Plain text body (first 400 chars) ===" + RESET)
@@ -471,7 +614,37 @@ def main():
     content_type_hdr = msg["Content-Type"]
     thread_topic_hdr = msg["Thread-Topic"]
     org_authAs_hdr = msg["X-MS-Exchange-Organization-AuthAs"]
-    auth_results_hdr = msg["authentication-results"]
+
+    auth_results_headers = msg.get_all("authentication-results") or []
+    auth_spf = auth_dkim = auth_dmarc = None
+
+    if auth_results_headers:
+        primary_auth = auth_results_headers[0]
+        auth_parsed = parse_auth_results_header(primary_auth)
+        auth_spf = auth_parsed.get("spf")
+        auth_dkim = auth_parsed.get("dkim")
+        auth_dmarc = auth_parsed.get("dmarc")
+
+        if auth_dkim:
+            add_finding(
+                analysis_results,
+                category=Category.AUTH_RESULTS,
+                code=Code.DKIM_STATUS,
+                severity=Severity.INFO if auth_dkim == "pass" else Severity.MEDIUM,
+                message=f"DKIM status: {auth_dkim}",
+                status=auth_dkim,
+            )
+
+        if auth_dmarc:
+            add_finding(
+                analysis_results,
+                category=Category.AUTH_RESULTS,
+                code=Code.DMARC_STATUS,
+                severity=Severity.INFO if "pass" in auth_dmarc else Severity.MEDIUM,
+                message=f"DMARC status: {auth_dmarc}",
+                status=auth_dmarc,
+            )
+
 
     # Parse received-spf
     received_spf_hdrs = msg.get_all("received-spf") or []
@@ -482,6 +655,14 @@ def main():
     if received_spf_hdrs:
         primary_spf_header = received_spf_hdrs[0]
         parsed_spf_hdr = parse_received_spf(primary_spf_header)
+        add_finding(
+                analysis_results,
+                category=Category.SPF,
+                code=Code.SPF_STATUS,
+                severity=Severity.INFO if "pass" in parsed_spf_hdr["result"] else Severity.HIGH,
+                message=f"SPF status: {parsed_spf_hdr["result"]}",
+                status=parsed_spf_hdr["result"],
+            )
     
     # Check for CrossTenant Headers
     crossTenant = has_crosstenant_headers(msg)
@@ -496,6 +677,8 @@ def main():
     print(f"Thread-Topic:   {thread_topic_hdr!r}")
     print(f"Subject:        {subject_hdr!r}")
     print(f"Date:           {date_hdr!r}")
+    print()
+    print(f"Auth-Results:   {auth_results_headers!r}")
     print()
     print(f"Content-Type:     {content_type_hdr!r}")
     print(f"Content-Language: {content_language_hdr!r}")
@@ -514,6 +697,16 @@ def main():
     reply_to_domain = get_domain_from_address(reply_to_hdr)
     return_path_domain = get_domain_from_address(return_path_hdr)
 
+    if crossTenant:
+        add_finding(
+            analysis_results,
+            category=Category.HEADERS,
+            code=Code.CROSSTENANT_PRESENT,
+            severity=Severity.INFO if from_domain != to_domain else Severity.HIGH,
+            message=f"Cross tenant headers detected for internal email.",
+            status=crossTenant,
+        )
+
     print(f"From domain:            {from_domain}")
     print(f"To domain:              {to_domain}")
     if from_domain != to_domain and crossTenant:
@@ -524,25 +717,45 @@ def main():
     print(f"Return-Path domain:     {return_path_domain}")
     print()
 
+    if auth_results_headers:
+        print(f"{CYAN}=== Parsed Authentication Results ==={RESET}")
+        print(f"spf: {auth_spf}")
+        print(f"dkim: {auth_dkim}")
+        print(f"dmarc: {auth_dmarc}")
+        print()
+
+    if auth_dmarc == 'fail':
+        print(f"{RED}=== Email DMARC Failed Check ==={RESET}")
+        print(f"Emails that fail DMARC checking are more likely phishing emails.")
+        print()
+        add_finding(
+                analysis_results,
+                category=Category.DMARC,
+                code=Code.DMARC_FAIL,
+                severity=Severity.HIGH,
+                message=f"DMARC Failed Check",
+                status=auth_dmarc,
+            )
+
     if from_domain == to_domain and crossTenant:
         print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
-        print(f"Cross Tenant -> {crossTenant}")
+        print(f"Cross Tenant -> {crossTenant} => Internal domain emailing shouldn't have Cross Tenant headers")
         if org_authAs_hdr == "Anonymous":
             print(f"AuthAs -> {org_authAs_hdr}")
-        if parsed_spf_hdr["result"] == "fail":
+        if parsed_spf_hdr["result"] == "fail" or auth_spf == 'fail':
             print(f"SPF Failed -> Origin IP = {parsed_spf_hdr["client_ip"]}")
         print()
     
     if from_domain != to_domain:
-        if parsed_spf_hdr["result"] == "fail":
+        if parsed_spf_hdr["result"] == "fail" or auth_spf == 'fail':
             print(f"{RED}=== External Spoofing evidence found ==={RESET}")
             print(f"SPF Failed -> Origin IP = {parsed_spf_hdr["client_ip"]}")
         print()
-    
-    # print()
-    # print(f"{YELLOW}=== Other Potentially Phishy Evidence ==={RESET}")
-    # if parsed_spf_hdr["result"] == "fail" and from_domain != to_domain:
-    #     print(f"SPF Failed -> Origin IP = {parsed_spf_hdr["client_ip"]}")
+
+    # pretty-print JSON for now (CLI use)
+    if args.json:
+        print("\nJSON analysis results:")
+        print(json.dumps({"analysis_results": analysis_results}, indent=2))
 
 # Run main
 if __name__ == "__main__":
