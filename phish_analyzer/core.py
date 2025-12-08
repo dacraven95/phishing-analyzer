@@ -14,7 +14,7 @@ from email.policy import default as default_policy
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
-from colors import RED, GREEN, YELLOW, BLUE, RESET, CYAN, BRIGHT_GREEN, MAGENTA, BRIGHT_RED
+from .colors import RED, GREEN, YELLOW, BLUE, RESET, CYAN, BRIGHT_GREEN, MAGENTA, BRIGHT_RED
 from enum import Enum
 
 class Category(str, Enum):
