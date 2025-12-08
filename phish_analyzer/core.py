@@ -101,7 +101,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.3.0
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.3.1
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)

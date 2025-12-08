@@ -1,10 +1,20 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import os
 
 from phish_analyzer.core import run_analysis_capture_text  # adjust import to match your structure
 
 app = FastAPI()
+
+# Allow specific origins, or * for all
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # <--- or restrict to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/analyze")
 async def analyze_email(file: UploadFile = File(...)):
