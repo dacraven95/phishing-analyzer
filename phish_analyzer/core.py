@@ -110,7 +110,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.0
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.1
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -810,7 +810,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     if show_spinners:
         whoisSpinner.stop()
 
-    if whois_data['success']:
+    if whois_data:
         print(f"Domain:                 {whois_data['domain']}")
         print(f"Domain Registrar:       {whois_data['registrar']}")
         print(f"Domain Age:             {whois_data['domain_age_days']}")
@@ -823,6 +823,8 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
         print(f"Updated Date:           {whois_data['updated_date']}")
         print()
         print(f"Nameserver:             {whois_data['name_servers']}")
+    else:
+        print(YELLOW + "[*] Could not lookup WHOIS information for: " + from_domain + RESET)
 
     print()
 
@@ -1022,7 +1024,7 @@ def analyze_sender_rdap(domain: str, analysis_results):
         #     message=f"RDAP lookup failed for {rdap['domain']}",
         #     error=rdap["error"],
         # )
-        return "Failed RDAP checking..."
+        return
 
     # Example info finding
     # add_finding(
