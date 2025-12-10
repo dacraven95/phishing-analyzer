@@ -376,47 +376,83 @@ def _draw_terminal_block(
     lines = text_output.splitlines() if text_output else ["(no terminal output captured)"]
 
     for raw_line in lines:
-        # Check for page break
+        # If we've reached bottom, start a new page and redraw panel
         if text_y <= term_bottom_margin + 0.25 * inch:
             c.showPage()
             _draw_terminal_panel_background(c, width, height, margins)
             c.setFont(font_name, font_size)
             text_y = height - margins["top"] - 0.25 * inch
 
-        # Truncate line before parsing (to avoid off-page issues)
-        max_chars = 300  # a bit larger, we'll still clamp by width
-        line = raw_line[:max_chars]
+        line = raw_line  # no truncation here
 
-        # Parse ANSI spans: [(color, text), ...]
         spans = _parse_ansi_spans(line)
-
         cursor_x = text_x_start
 
         for color_val, span_text in spans:
             if not span_text:
                 continue
 
-            # Clip overly long text that would go beyond the panel
-            max_width = term_right - cursor_x - 0.15 * inch
-            if max_width <= 0:
-                break
+            # We may need to wrap this span across multiple lines
+            remaining = span_text
+            while remaining:
+                # If current line is full, move to next line
+                max_width = term_right - cursor_x - 0.15 * inch
+                if max_width <= 0:
+                    text_y -= line_height
+                    cursor_x = text_x_start
 
-            span_width = c.stringWidth(span_text, font_name, font_size)
+                    # Page break if needed
+                    if text_y <= term_bottom_margin + 0.25 * inch:
+                        c.showPage()
+                        _draw_terminal_panel_background(c, width, height, margins)
+                        c.setFont(font_name, font_size)
+                        text_y = height - margins["top"] - 0.25 * inch
 
-            if span_width > max_width:
-                # Rough clipping by char count if needed
-                # (since it's monospace, this is okay)
-                avg_char_width = span_width / len(span_text)
-                max_chars_fit = int(max_width / avg_char_width)
-                if max_chars_fit <= 0:
-                    break
-                span_text = span_text[:max_chars_fit]
-                span_width = c.stringWidth(span_text, font_name, font_size)
+                    max_width = term_right - cursor_x - 0.15 * inch
 
-            c.setFillColor(color_val)
-            c.drawString(cursor_x, text_y, span_text)
-            cursor_x += span_width
+                span_width = c.stringWidth(remaining, font_name, font_size)
 
+                if span_width <= max_width:
+                    # Entire remaining span fits on this line
+                    c.setFillColor(color_val)
+                    c.drawString(cursor_x, text_y, remaining)
+                    cursor_x += span_width
+                    remaining = ""  # done with this span
+                else:
+                    # Need to split this span across lines
+                    # Since we're using Courier (monospace), this estimate is fine
+                    avg_char_width = span_width / len(remaining)
+                    max_chars_fit = int(max_width / avg_char_width)
+                    if max_chars_fit <= 0:
+                        # Nothing fits; force line break and try again
+                        text_y -= line_height
+                        cursor_x = text_x_start
+
+                        if text_y <= term_bottom_margin + 0.25 * inch:
+                            c.showPage()
+                            _draw_terminal_panel_background(c, width, height, margins)
+                            c.setFont(font_name, font_size)
+                            text_y = height - margins["top"] - 0.25 * inch
+
+                        continue
+
+                    part = remaining[:max_chars_fit]
+                    remaining = remaining[max_chars_fit:]
+
+                    c.setFillColor(color_val)
+                    c.drawString(cursor_x, text_y, part)
+                    # move to next line for the remainder
+                    text_y -= line_height
+                    cursor_x = text_x_start
+
+                    # Page break if needed before drawing the next chunk
+                    if text_y <= term_bottom_margin + 0.25 * inch:
+                        c.showPage()
+                        _draw_terminal_panel_background(c, width, height, margins)
+                        c.setFont(font_name, font_size)
+                        text_y = height - margins["top"] - 0.25 * inch
+
+        # After finishing this logical line, move to the next PDF line
         text_y -= line_height
 
 

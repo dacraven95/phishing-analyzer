@@ -19,6 +19,7 @@ from enum import Enum
 from .pdfReport import generate_pdf_report
 from datetime import datetime
 from halo import Halo
+from phish_analyzer.rdapHelper import lookup_rdap
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -73,6 +74,10 @@ class Code(str, Enum):
     FROM_RETURNPATH_MISMATCH = "FROM_RETURNPATH_MISMATCH"
     MISSING_HEADER = "MISSING_HEADER"
 
+    # Domain Related
+    WHOIS_BASIC_INFO = "WHOIS_BASIC_INFO"
+    WHOIS_LOOKUP_FAILED = "WHOIS_LOOKUP_FAILED"
+
 URL_REGEX = re.compile(
     r'(?i)\b((?:https?://|www\.)[^\s<>"]+)', 
     re.IGNORECASE
@@ -105,7 +110,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.3.4
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.0
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -582,7 +587,7 @@ def extract_dns_records(domain: str):
 
     return output
 
-def run_analysis(file_path: str, use_json: bool = False):
+def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = True):
 
     print_banner()
 
@@ -619,8 +624,11 @@ def run_analysis(file_path: str, use_json: bool = False):
     mime_version_hdr = msg["MIME-Version"] or None
     content_language_hdr = msg["Content-Language"] or None
     content_type_hdr = msg["Content-Type"] or None
+    content_transfer_encode_hdr = msg["Content-Transfer-Encoding"] or None
     thread_topic_hdr = msg["Thread-Topic"] or None
     org_authAs_hdr = msg["X-MS-Exchange-Organization-AuthAs"] or None
+    has_attachment_hdr = msg["X-MS-Has-Attach"] or None
+    origin_IP_hdr = msg["X-Originating-IP"] or None
 
     auth_results_headers = msg.get_all("authentication-results") or []
     hasAuthHeaders = True if auth_results_headers else False
@@ -787,15 +795,50 @@ def run_analysis(file_path: str, use_json: bool = False):
     print(f"Return-Path domain:     {return_path_domain}")
     print()
 
+    # -------------------------------------------
+    # Analyze WHOIS for Sending Domain
+    # -------------------------------------------
+
+    print(f"{CYAN}=== Parsed Sender Domain WHOIS ==={RESET}")
+    
+    if show_spinners:
+        whoisSpinner = Halo(text="Perfomring WHOIS lookup...", spinner="dots")
+        whoisSpinner.start()
+
+    whois_data = analyze_sender_rdap(from_domain, analysis_results)
+    
+    if show_spinners:
+        whoisSpinner.stop()
+
+    if whois_data['success']:
+        print(f"Domain:                 {whois_data['domain']}")
+        print(f"Domain Registrar:       {whois_data['registrar']}")
+        print(f"Domain Age:             {whois_data['domain_age_days']}")
+        if whois_data['domain_age_days'] <= 180:
+            print(RED + '[-] Domain is newly registered' + RESET)
+        if whois_data['domain_age_days'] <= 365 and whois_data['domain_age_days'] > 180:
+            print(YELLOW + '[*] Domain is young' + RESET)
+        print(f"Creation Date:          {whois_data['creation_date']}")
+        print(f"Expiration Date:        {whois_data['expiration_date']}")
+        print(f"Updated Date:           {whois_data['updated_date']}")
+        print()
+        print(f"Nameserver:             {whois_data['name_servers']}")
+
+    print()
+
     # ----------------------------------------------------------------------
     # Output DNS Records for Sending Domain
     # ----------------------------------------------------------------------
     print(f"{CYAN}=== Parsed Sender DNS Records ==={RESET}")
 
-    spinner = Halo(text="Querying DNS Records...", spinner="dots")
-    spinner.start()
+    if show_spinners:
+        spinner = Halo(text="Querying DNS Records...", spinner="dots2")
+        spinner.start()
+
     dns_results = extract_dns_records(from_domain)
-    spinner.stop()
+    
+    if show_spinners:
+        spinner.stop()
 
     for r in dns_results:
         print(f"- {r}")
@@ -870,7 +913,7 @@ def run_analysis(file_path: str, use_json: bool = False):
 def run_analysis_and_pdf(file_path: str, pdf_path: str):
     analysis_results = []  # your existing findings list
     # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=True, strip_ansi=False)
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
 
     metadata = {
         "file_name": file_path,
@@ -933,13 +976,81 @@ def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi
     buffer = io.StringIO()
     # Redirect stdout into our buffer while run_analysis executes
     with contextlib.redirect_stdout(buffer):
-        run_analysis(file_path, use_json=use_json)
+        run_analysis(file_path, use_json=use_json, show_spinners=False)
 
     ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
     # Get everything that was printed
     output = buffer.getvalue()
     return ANSI_RE.sub("", output) if strip_ansi else output
+
+def analyze_sender_whois(domain: str, analysis_results):
+    whois_info = lookup_whois(domain)
+
+    if not whois_info["success"]:
+        add_finding(
+            analysis_results,
+            category=Category.METADATA,
+            code=Code.WHOIS_LOOKUP_FAILED,
+            severity=Severity.LOW,
+            message=f"WHOIS lookup failed for domain {whois_info['domain']!r}",
+            error=whois_info["error"],
+        )
+        return
+
+    # Example heuristics you can build on:
+    add_finding(
+        analysis_results,
+        category=Category.METADATA,
+        code=Code.WHOIS_BASIC_INFO,
+        severity=Severity.INFO,
+        message=f"WHOIS data for {whois_info['domain']}",
+        registrar=whois_info["registrar"],
+        creation_date=whois_info["creation_date"],
+        expiration_date=whois_info["expiration_date"],
+    )
+
+def analyze_sender_rdap(domain: str, analysis_results):
+    rdap = lookup_rdap(domain)
+
+    if not rdap["success"]:
+        # add_finding(
+        #     analysis_results,
+        #     category=Category.METADATA,
+        #     code=Code.RDAP_LOOKUP_FAILED,   # add to your Enum
+        #     severity=Severity.LOW,
+        #     message=f"RDAP lookup failed for {rdap['domain']}",
+        #     error=rdap["error"],
+        # )
+        return "Failed RDAP checking..."
+
+    # Example info finding
+    # add_finding(
+    #     analysis_results,
+    #     category=Category.METADATA,
+    #     code=Code.RDAP_BASIC_INFO,
+    #     severity=Severity.INFO,
+    #     message=f"RDAP data for {rdap['domain']}",
+    #     registrar=rdap["registrar"],
+    #     creation_date=rdap["creation_date"],
+    #     expiration_date=rdap["expiration_date"],
+    #     domain_age_days=rdap["domain_age_days"],
+    # )
+
+    # Example heuristic: very young domain
+    # if rdap["domain_age_days"] is not None and rdap["domain_age_days"] < 30:
+    #     add_finding(
+    #         analysis_results,
+    #         category=Category.METADATA,
+    #         code=Code.RDAP_YOUNG_DOMAIN,
+    #         severity=Severity.HIGH,
+    #         message=(
+    #             f"Domain {rdap['domain']} appears to be very new "
+    #             f"({rdap['domain_age_days']} days old)"
+    #         ),
+    #     )
+
+    return rdap
 
 # Run main
 # if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [project]
 name = "phish-analyzer"
-version = "0.3.4"
+version = "0.4.0"
 description = "Email phishing analysis tool"
 authors = [
     { name="DC", email="dacraven95@gmail.com" }
@@ -14,6 +14,7 @@ dependencies = [
     "python-multipart>=0.0.7",
     "reportlab>=4.0.0",
     "halo>=0.0.31",
+    "requests>=2.32.0",
 ]
 
 [build-system]
