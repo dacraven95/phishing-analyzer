@@ -824,7 +824,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
         print()
         print(f"Nameserver:             {whois_data['name_servers']}")
     else:
-        print(YELLOW + "[*] Could not lookup WHOIS information for: " + from_domain + RESET)
+        print(YELLOW + "[*] Could not lookup WHOIS information" + RESET)
 
     print()
 
