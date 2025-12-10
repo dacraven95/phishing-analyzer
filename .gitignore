@@ -26,6 +26,10 @@ headers/
 raw_headers/
 *.headers
 *.email
+phish-report-*
+phish-analyze.py
+reports/
+ignore-*
 
 # ===========================================
 # Editor / OS Noise

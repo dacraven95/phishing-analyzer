@@ -1,0 +1,7 @@
+services:
+  phish-analyzer-api:
+    image: phish-analyzer-api:latest
+    container_name: phish-analyzer-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

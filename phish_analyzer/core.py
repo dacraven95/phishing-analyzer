@@ -16,6 +16,9 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
 from .colors import RED, GREEN, YELLOW, BLUE, RESET, CYAN, BRIGHT_GREEN, MAGENTA, BRIGHT_RED
 from enum import Enum
+from .pdfReport import generate_pdf_report
+from datetime import datetime
+from halo import Halo
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -68,6 +71,7 @@ class Code(str, Enum):
     CROSSTENANT_PRESENT = "CROSSTENANT_PRESENT"
     FROM_REPLYTO_MISMATCH = "FROM_REPLYTO_MISMATCH"
     FROM_RETURNPATH_MISMATCH = "FROM_RETURNPATH_MISMATCH"
+    MISSING_HEADER = "MISSING_HEADER"
 
 URL_REGEX = re.compile(
     r'(?i)\b((?:https?://|www\.)[^\s<>"]+)', 
@@ -101,7 +105,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.3.1
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.3.4
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -606,8 +610,8 @@ def run_analysis(file_path: str, use_json: bool = False):
     # Pull Headers from Headers Block
     # ----------------------------------------------------------
 
-    from_hdr = msg["From"]
-    to_hdr = msg["To"]
+    from_hdr = msg["From"] or None
+    to_hdr = msg["To"] or None
     reply_to_hdr = msg["Reply-To"] or None
     return_path_hdr = msg["Return-Path"] or None
     date_hdr = msg["Date"]
@@ -764,6 +768,16 @@ def run_analysis(file_path: str, use_json: bool = False):
         )
 
     print(f"From domain:            {from_domain}")
+    if from_domain == None:
+        print(f"{RED}[-] 'From' Headers missing!{RESET}")
+        add_finding(
+            analysis_results,
+            category=Category.HEADERS,
+            code=Code.MISSING_HEADER,
+            severity=Severity.HIGH,
+            message=f"From headers are missing! This is suspicious.",
+            status=Code.MISSING_HEADER,
+        )
     print(f"To domain:              {to_domain}")
     if from_domain != to_domain and crossTenant:
         print(f"{BRIGHT_GREEN}Cross Tenant:           {crossTenant}{RESET}")
@@ -777,8 +791,15 @@ def run_analysis(file_path: str, use_json: bool = False):
     # Output DNS Records for Sending Domain
     # ----------------------------------------------------------------------
     print(f"{CYAN}=== Parsed Sender DNS Records ==={RESET}")
-    for r in extract_dns_records(from_domain):
+
+    spinner = Halo(text="Querying DNS Records...", spinner="dots")
+    spinner.start()
+    dns_results = extract_dns_records(from_domain)
+    spinner.stop()
+
+    for r in dns_results:
         print(f"- {r}")
+    
     print()
 
     # ----------------------------------------------------------------------
@@ -804,12 +825,6 @@ def run_analysis(file_path: str, use_json: bool = False):
                 status=auth_dmarc,
             )
         
-    # checkDMARCRecords = dns.resolver.resolve(f"{to_domain}", "MX")
-    # for r in checkDMARCRecords:
-    #     print(r)
-    # print()
-    # print()
-
     if from_domain == to_domain and hasSPFHeaders:
         if parsed_spf_hdr['result'] == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
             print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
@@ -827,6 +842,10 @@ def run_analysis(file_path: str, use_json: bool = False):
             print(f"{RED}=== External Spoofing evidence found ==={RESET}")
             print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']}")
         print()
+
+    # Print if no From Headers are found
+    if from_hdr == None:
+        print(RED + '[-] No From Headers Found - Very suspicious!' + RESET)
 
     # Print if no Auth Headers are found 
     if hasAuthHeaders == False:
@@ -847,6 +866,25 @@ def run_analysis(file_path: str, use_json: bool = False):
 ===============================================================================
 {RESET}
 """)
+
+def run_analysis_and_pdf(file_path: str, pdf_path: str):
+    analysis_results = []  # your existing findings list
+    # ... run your usual logic to fill analysis_results and capture text_output ...
+    text_output = run_analysis_capture_text(file_path, use_json=True, strip_ansi=False)
+
+    metadata = {
+        "file_name": file_path,
+        "overall_verdict": "N/A",  # or whatever you compute
+        "overall_score": "N/A",              # optional
+        "analyzed_at": datetime.now(),
+    }
+
+    generate_pdf_report(
+        output_path=pdf_path,
+        text_output=text_output,
+        analysis_results=analysis_results,
+        metadata=metadata,
+    )
 
 def main():
     
@@ -887,7 +925,6 @@ def main():
 {RESET}
 """)
     
-
 def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi: bool = True) -> str:
     """
     Run the analysis and capture the full terminal-style output
@@ -905,12 +942,5 @@ def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi
     return ANSI_RE.sub("", output) if strip_ansi else output
 
 # Run main
-if __name__ == "__main__":
-    # print_banner()
-    main()
-#     print(rf"""{BRIGHT_GREEN}
-# ===============================================================================
-#    Analysis Complete: Please perform manual investigation to verify findings
-# ===============================================================================
-# {RESET}
-# """)
+# if __name__ == "__main__":
+    # main()

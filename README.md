@@ -70,13 +70,14 @@ pip install .
 ### Analyze a file (header txt or eml)
 
 ```bash
-python phish-analyze.py -f email_headers.txt
+python cli.py -f email_headers.txt
+python cli.py -f email.eml
 ```
-Or:
+Or to generate the terminal output into a PDF report as your output:
 ```bash
-python phish-analyze.py -f sample.eml
+python cli.py -f email.eml -r -o my-report.pdf
 ```
-
+`Note: PDF generation is still a new feature and the report mainly just shows a formatted terminal output.`
 ---
 
 ## 📄 Example Output
