@@ -110,7 +110,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.1
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.2
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -587,29 +587,53 @@ def extract_dns_records(domain: str):
 
     return output
 
-def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = True):
+def get_file_extension(file):
+    
+    _, ext = os.path.splitext(file)
+    return ext.lower()
+
+def parse_detected_filetype(ext, filename):
+    if ext == ".eml":
+        # Handle EML file
+        return parse_full_eml(filename)
+    else:
+        # Handle as TXT file
+        return parse_headers_from_file(filename)
+
+def get_email_body(file_path):
+    # Get file extension
+    ext = get_file_extension(file_path)
+    
+    # Check for file type .eml, .txt and parse message
+    msg = parse_detected_filetype(ext, file_path)
+
+    plain_body, html_body = extract_bodies(msg)
+
+    if plain_body:
+        email_body = plain_body
+    if html_body:
+        email_body = html_body
+
+    return email_body
+
+def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = True, generate_pdf: bool = False):
 
     print_banner()
 
     analysis_results = []
 
     # Get file extension
-    filename = file_path
-    _, ext = os.path.splitext(filename)
-    ext = ext.lower()
+    ext = get_file_extension(file_path)
 
-    # Check for file type: .eml, .txt
-    if ext == ".eml":
-        # Handle EML file
+    if ext == '.eml':
         print(GREEN + "[+] Detected EML file" + RESET)
         print()
-        msg = parse_full_eml(filename)
     else:
-        # Handle as TXT file
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
-        msg = parse_headers_from_file(filename)
-
+    
+    # Check for file type .eml, .txt and parse message
+    msg = parse_detected_filetype(ext, file_path)
 
     # ----------------------------------------------------------
     # Pull Headers from Headers Block
@@ -911,12 +935,12 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
 ===============================================================================
 {RESET}
 """)
+    
+    
 
 def run_analysis_and_pdf(file_path: str, pdf_path: str):
     analysis_results = []  # your existing findings list
-    # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
-
+    
     metadata = {
         "file_name": file_path,
         "overall_verdict": "N/A",  # or whatever you compute
@@ -924,53 +948,59 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str):
         "analyzed_at": datetime.now(),
     }
 
+    # ... run your usual logic to fill analysis_results and capture text_output ...
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False, metadata=metadata, pdf_path=pdf_path, analysis_results=analysis_results)
+
+    email_body = get_email_body(file_path)
+
     generate_pdf_report(
         output_path=pdf_path,
         text_output=text_output,
         analysis_results=analysis_results,
         metadata=metadata,
+        email_body=email_body
     )
 
-def main():
+# def main():
     
-    print_banner()
+#     print_banner()
 
-    parser = argparse.ArgumentParser(
-        description="Step 1: just parse and print basic email headers."
-    )
+#     parser = argparse.ArgumentParser(
+#         description="Step 1: just parse and print basic email headers."
+#     )
 
-    parser.add_argument(
-        "-f", "--file",
-        required=True,
-        help="Path to a text file containing raw email headers.",
-    )
+#     parser.add_argument(
+#         "-f", "--file",
+#         required=True,
+#         help="Path to a text file containing raw email headers.",
+#     )
 
-    parser.add_argument(
-        "-j", "--json",
-        action="store_true",
-        help="Include output of analysis_results as JSON"
-    )
+#     parser.add_argument(
+#         "-j", "--json",
+#         action="store_true",
+#         help="Include output of analysis_results as JSON"
+#     )
 
-    # parser.add_argument(
-    #     "--no-color",
-    #     action="store_true",
-    #     help="Disable ANSI color codes in output"
-    # )
+#     # parser.add_argument(
+#     #     "--no-color",
+#     #     action="store_true",
+#     #     help="Disable ANSI color codes in output"
+#     # )
 
-    args = parser.parse_args()
+#     args = parser.parse_args()
 
-    run_analysis(args.file, use_json=args.json)
-    # result_text = run_analysis_capture_text(args.file, use_json=True)
-    # print(result_text)
+#     run_analysis(args.file, use_json=args.json)
+#     # result_text = run_analysis_capture_text(args.file, use_json=True)
+#     # print(result_text)
 
-    print(rf"""{BRIGHT_GREEN}
-===============================================================================
-   Analysis Complete: Please perform manual investigation to verify findings
-===============================================================================
-{RESET}
-""")
+#     print(rf"""{BRIGHT_GREEN}
+# ===============================================================================
+#    Analysis Complete: Please perform manual investigation to verify findings
+# ===============================================================================
+# {RESET}
+# """)
     
-def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi: bool = True) -> str:
+def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi: bool = True, metadata: dict = {}, pdf_path: str = "", analysis_results: list = []) -> str:
     """
     Run the analysis and capture the full terminal-style output
     as a single string, instead of printing it to the real terminal.

@@ -7,6 +7,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
 
 import re
 
@@ -17,6 +18,7 @@ def generate_pdf_report(
     text_output: str,
     analysis_results: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    email_body: str | None = None,
 ) -> None:
     """
     Generate a PDF report for a phishing analysis run.
@@ -54,8 +56,21 @@ def generate_pdf_report(
     y -= 0.25 * inch
     y = _draw_summary_box(c, width, margins, y, analysis_results, metadata)
 
+    # Draw email body block
+    if email_body:
+        # Space before email body block
+        y -= 0.5 * inch
+        y = _draw_email_body_block(
+            c,
+            email_body=email_body,
+            width=width,
+            height=height,
+            margins=margins,
+            start_y=y,
+        )
+
     # Space before terminal block
-    y -= 0.5 * inch
+    # y -= 0.5 * inch
 
     # Draw terminal-like block with the text_output
     _draw_terminal_block(
@@ -71,6 +86,65 @@ def generate_pdf_report(
 
 
 # ------------ Internal helpers ------------
+
+def _draw_email_body_block(
+    c: canvas.Canvas,
+    width: float,
+    height: float,
+    margins: Dict[str, float],
+    start_y: float,
+    email_body: str,
+) -> None:
+    """
+    Draws the email body as a rendered text block after the summary and
+    returns the new Y position to continue drawing from.
+    """
+    if not email_body:
+        return start_y
+
+    left = margins["left"] + 0.4 * inch
+    right = width - margins["right"] - 0.4 * inch
+    max_width = right - left
+
+    heading_font = "Helvetica-Bold"
+    body_font = "Helvetica"
+    heading_size = 12
+    body_size = 9
+    line_height = body_size * 1.4
+    heading_gap = 0.3 * inch
+
+    text_y = start_y
+
+    # Page break before heading if we're too low
+    if text_y <= margins["bottom"] + 1.0 * inch:
+        c.showPage()
+        # if you have a page background/header function, call it here
+        # _draw_page_frame(c, width, height, margins)
+        text_y = height - margins["top"] - 0.5 * inch
+
+    # Heading
+    c.setFont(heading_font, heading_size)
+    c.drawString(left, text_y, "Email Body (rendered)")
+    text_y -= heading_gap
+
+    c.setFont(body_font, body_size)
+    wrapped_lines = _wrap_text_lines(email_body, max_width, body_font, body_size)
+
+    for line in wrapped_lines:
+        if text_y <= margins["bottom"] + 0.5 * inch:
+            # New page and reset Y if we run out of space
+            c.showPage()
+            # again, call your page frame/header if you have one:
+            # _draw_page_frame(c, width, height, margins)
+            c.setFont(body_font, body_size)
+            text_y = height - margins["top"] - 0.5 * inch
+
+        c.drawString(left, text_y, line)
+        text_y -= line_height
+
+    # Add a bit of space before whatever comes next
+    text_y -= 0.3 * inch
+    return text_y
 
 # Regex to match ANSI color codes like \x1b[91m, \x1b[0m, etc.
 ANSI_COLOR_RE = re.compile(r"\x1b\[(\d+)(?:;(\d+))?m")
@@ -126,6 +200,35 @@ def _ansi_color_for_code(code: str):
     # Fallback
     return colors.lawngreen
 
+def _wrap_text_lines(text: str, max_width: float, font_name: str, font_size: float) -> list[str]:
+    """
+    Simple word-wrap: breaks a long text into lines that fit within max_width.
+    """
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        words = raw_line.split(" ")
+        if not words:
+            lines.append("")  # keep empty lines
+            continue
+
+        current = ""
+        for word in words:
+            candidate = word if not current else current + " " + word
+            if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                # word itself may be longer than max_width; hard-break if needed
+                while pdfmetrics.stringWidth(word, font_name, font_size) > max_width:
+                    # rough split by character count
+                    avg_char = pdfmetrics.stringWidth(word, font_name, font_size) / len(word)
+                    max_chars = max(1, int(max_width / avg_char))
+                    lines.append(word[:max_chars])
+                    word = word[max_chars:]
+                current = word
+        lines.append(current)
+    return lines
 
 def _parse_ansi_spans(line: str):
     """

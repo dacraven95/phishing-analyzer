@@ -17,6 +17,7 @@ venv/
 *.msg
 *.pst
 *.mbox
+*.pdf
 *email*.txt
 *samples*.txt
 test-emails/

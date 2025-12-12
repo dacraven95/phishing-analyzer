@@ -54,7 +54,7 @@ async def analyze_email(
             return FileResponse(
                 path=pdf_path,
                 media_type="application/pdf",
-                filename="phish-report.pdf",
+                filename=f"phish-report-{datetime.now()}.pdf",
             )
 
         # 4) Otherwise just return text/JSON output
