@@ -1,5 +1,9 @@
+"""
+Responsible for generating the PDFs for reporting
+"""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -7,9 +11,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 
-import re
+from phish_analyzer.html_render import render_html_to_png
 
 # ------------ Public API ------------
 
@@ -56,8 +61,33 @@ def generate_pdf_report(
     y -= 0.25 * inch
     y = _draw_summary_box(c, width, margins, y, analysis_results, metadata)
 
+    html_png_path = None
     # Draw email body block
     if email_body:
+
+        if is_html(email_body):
+
+            html_png_path = render_html_to_png(
+                email_body,
+                output_png_path="./reports/email_render.png",
+                viewport_width=900,
+                viewport_height=1200,
+                full_page=True,
+            )
+
+            # Space before email render block
+            y -= 0.5 * inch
+
+            y = _draw_email_html_screenshot(
+                c,
+                png_path=html_png_path,
+                width=width,
+                height=height,
+                margins=margins,
+                start_y=y
+            )
+
+
         # Space before email body block
         y -= 0.5 * inch
         y = _draw_email_body_block(
@@ -87,6 +117,73 @@ def generate_pdf_report(
 
 # ------------ Internal helpers ------------
 
+def is_html(email_body):
+    if "<html" in email_body:
+        return True
+    else:
+        return False
+
+def _draw_email_html_screenshot(c, png_path: str, width: float, height: float, margins: dict, start_y: float) -> float:
+    """
+    Draw the rendered HTML screenshot PNG into the PDF. Returns new Y position.
+    """
+    if not png_path:
+        return start_y
+
+    left = margins["left"]
+    right = width - margins["right"]
+    max_w = right - left
+
+    # Heading
+    heading_font = "Helvetica-Bold"
+    heading_size = 12
+    heading_gap = 0.3 * inch
+
+    text_y = start_y
+
+    c.setFont(heading_font, heading_size)
+    c.setFillColor(colors.black)
+    c.drawString(left, start_y, "Email Body (rendered as image)")
+
+    text_y -= (heading_size * 1.2)      # line height for heading
+    # text_y -= (0.12 * inch)             # extra breathing room
+
+    # Reserve a reasonable height; you can tune this.
+    max_h = 4.5 * inch
+    pad = 0.10 * inch
+
+    # Page break if not enough space
+    if start_y - max_h < margins["bottom"] + 0.5 * inch:
+        c.showPage()
+        start_y = height - margins["top"] - 0.5 * inch
+
+    img = ImageReader(png_path)
+    iw, ih = img.getSize()
+
+    # Scale to fit within max_w x max_h (preserve aspect)
+    scale = min(max_w / iw, max_h / ih)
+    draw_w = iw * scale
+    draw_h = ih * scale
+
+    frame_w = max_w
+    frame_h = draw_h + pad*2
+
+    frame_x = left
+    frame_y = start_y - frame_h
+
+    # ✅ background + border
+    c.setFillColor(colors.whitesmoke)
+    c.setStrokeColor(colors.lightgrey)
+    c.setLineWidth(1)
+    # c.rect(frame_x, frame_y, frame_w, frame_h, stroke=1, fill=1)
+
+    # image inside frame
+    x = frame_x + pad
+    y = frame_y - 1.2
+    c.drawImage(img, x, y, width=draw_w, height=draw_h, mask="auto")
+
+    return y - 0.3 * inch
+
 def _draw_email_body_block(
     c: canvas.Canvas,
     width: float,
@@ -102,14 +199,16 @@ def _draw_email_body_block(
     if not email_body:
         return start_y
 
-    left = margins["left"] + 0.4 * inch
-    right = width - margins["right"] - 0.4 * inch
+    left = margins["left"]
+    right = width - margins["right"]
+    # left = margins["left"] + 0.4 * inch
+    # right = width - margins["right"] - 0.4 * inch
     max_width = right - left
 
     heading_font = "Helvetica-Bold"
     body_font = "Helvetica"
     heading_size = 12
-    body_size = 9
+    body_size = 6
     line_height = body_size * 1.4
     heading_gap = 0.3 * inch
 
@@ -123,8 +222,9 @@ def _draw_email_body_block(
         text_y = height - margins["top"] - 0.5 * inch
 
     # Heading
+    c.setFillColor(colors.black)
     c.setFont(heading_font, heading_size)
-    c.drawString(left, text_y, "Email Body (rendered)")
+    c.drawString(left, text_y, "Email Body (plain text)")
     text_y -= heading_gap
 
     c.setFont(body_font, body_size)

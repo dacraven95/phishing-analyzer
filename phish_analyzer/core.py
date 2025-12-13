@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
+"""
+Core module for processing the email files for analysis
+"""
+
 import os
-import argparse
 import re
 import ipaddress
 import json
-import dns.resolver
 import io
 import contextlib
 
@@ -14,12 +16,19 @@ from email.policy import default as default_policy
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
-from .colors import RED, GREEN, YELLOW, BLUE, RESET, CYAN, BRIGHT_GREEN, MAGENTA, BRIGHT_RED
 from enum import Enum
-from .pdfReport import generate_pdf_report
 from datetime import datetime
+
+# Third party imports
 from halo import Halo
+import dns.resolver
+
+# first party imports
 from phish_analyzer.rdapHelper import lookup_rdap
+
+# Local imports
+from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED
+from .pdfReport import generate_pdf_report
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -79,7 +88,7 @@ class Code(str, Enum):
     WHOIS_LOOKUP_FAILED = "WHOIS_LOOKUP_FAILED"
 
 URL_REGEX = re.compile(
-    r'(?i)\b((?:https?://|www\.)[^\s<>"]+)', 
+    r'(?i)\b((?:https?://|www\.)[^\s<>"]+)',
     re.IGNORECASE
 )
 
@@ -110,12 +119,17 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.2
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.3
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
 
-def add_finding(results_list, category: Category, code: Code, severity: Severity, message: str, **data):
+def add_finding(results_list,
+                category: Category,
+                code: Code,
+                severity: Severity,
+                message: str,
+                **data):
     """
     Append a standardized finding object into the shared analysis_results list.
     """
@@ -144,15 +158,14 @@ def extract_header_block(raw: str) -> str:
     Headers end at the first blank line.
     """
     lines = raw.splitlines()
-
-    # Find the first "start" of a header: a line containing "Something:"  
+    # Find the first "start" of a header: a line containing "Something:"
     # and then gather everything until the first blank line.
     header_started = False
     header_lines = []
-    
+
     for line in lines:
         if not header_started:
-            if ":" in line and "#" not in line:           
+            if ":" in line and "#" not in line:
                 header_started = True
                 header_lines.append(line)
         else:
@@ -443,7 +456,7 @@ def analyze_url(url: str, analysis_results) -> dict:
 def parse_headers_from_file(path: str):
     """
     Read raw header text from a file and parse into an email Message object.
-    
+
     :param path: Path to headers text file.
     :type path: str
     """
@@ -459,23 +472,24 @@ def parse_headers_from_file(path: str):
 def get_domain_from_address(header_value: str | None) -> str | None:
     """
     Extract domain from an email address header like 'Name <user@example.com>'
-    
+
     :param header_value: Description
     :type header_value: str | None
     :return: Description
     :rtype: str | None
     """
-    
+
     # Validation checks
     if not header_value:
-        return None
-    
+        return None, None
+
     display_name, email_addr = parseaddr(header_value)
-    if "@" not in email_addr:
-        return None
-    
+
+    if not email_addr or "@" not in email_addr:
+        return None, display_name or None
+
     # Return lowercase domain name from email
-    return email_addr.split("@", 1)[1].lower()
+    return email_addr.split("@", 1)[1].lower(), (display_name or None)
 
 def parse_received_spf(spf_header: str):
     """
@@ -536,7 +550,7 @@ def safe_dns_query(domain: str, record_type: str):
     Perform a DNS query safely and return:
       - list of answers, or
       - None if not found / error
-    
+
     Does NOT raise exceptions.
     """
     try:
@@ -566,29 +580,34 @@ def safe_dns_query(domain: str, record_type: str):
 def extract_dns_records(domain: str):
 
     # Look for all record types
-    mxRecords = safe_dns_query(f"{domain}", "MX") or []
-    aRecords = safe_dns_query(f"{domain}", "A") or []
-    cnameRecords = safe_dns_query(f"{domain}", "CNAME") or []
-    txtRecords = safe_dns_query(f"{domain}", "TXT") or []
+    mx_records = safe_dns_query(f"{domain}", "MX") or []
+    a_records = safe_dns_query(f"{domain}", "A") or []
+    cname_records = safe_dns_query(f"{domain}", "CNAME") or []
+    txt_records = safe_dns_query(f"{domain}", "TXT") or []
 
     output = []
 
-    for r in aRecords:
+    for r in a_records:
         output.append("A        " + r)
 
-    for r in cnameRecords:
+    for r in cname_records:
         output.append("CNAME    " + r)
-    
-    for r in mxRecords:
+
+    for r in mx_records:
         output.append("MX       " + r)
-    
-    for r in txtRecords:
+
+    for r in txt_records:
         output.append("TXT      " + r)
 
     return output
 
 def get_file_extension(file):
+    '''
+    Identify & return the file extension
     
+    :param file: The file
+    '''
+
     _, ext = os.path.splitext(file)
     return ext.lower()
 
@@ -603,7 +622,7 @@ def parse_detected_filetype(ext, filename):
 def get_email_body(file_path):
     # Get file extension
     ext = get_file_extension(file_path)
-    
+
     # Check for file type .eml, .txt and parse message
     msg = parse_detected_filetype(ext, file_path)
 
@@ -616,7 +635,9 @@ def get_email_body(file_path):
 
     return email_body
 
-def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = True, generate_pdf: bool = False):
+def run_analysis(file_path: str,
+                 use_json: bool = False,
+                 show_spinners: bool = True):
 
     print_banner()
 
@@ -631,7 +652,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     else:
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
-    
+
     # Check for file type .eml, .txt and parse message
     msg = parse_detected_filetype(ext, file_path)
 
@@ -639,12 +660,14 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     # Pull Headers from Headers Block
     # ----------------------------------------------------------
 
+    received_from_hdr = msg.get_all("Received") or []
+
     from_hdr = msg["From"] or None
     to_hdr = msg["To"] or None
     reply_to_hdr = msg["Reply-To"] or None
     return_path_hdr = msg["Return-Path"] or None
-    date_hdr = msg["Date"]
-    subject_hdr = msg["Subject"]
+    date_hdr = msg["Date"] or None
+    subject_hdr = msg["Subject"] or None
     mime_version_hdr = msg["MIME-Version"] or None
     content_language_hdr = msg["Content-Language"] or None
     content_type_hdr = msg["Content-Type"] or None
@@ -655,7 +678,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     origin_IP_hdr = msg["X-Originating-IP"] or None
 
     auth_results_headers = msg.get_all("authentication-results") or []
-    hasAuthHeaders = True if auth_results_headers else False
+    hasAuthHeaders = bool(auth_results_headers)
     auth_spf = auth_dkim = auth_dmarc = None
 
     # ----------------------------------------------------------
@@ -681,8 +704,8 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
 
     if found_URLS:
         print(CYAN + "\n=== URLs Found in Body ===" + RESET)
-        for url in found_URLS:
-            print(" -", url)
+        # for url in found_URLS:
+        #     print(" -", url)
 
         # Flag IP-literal URLs
         ip_literal_URLS = [u for u in found_URLS if is_ip_literal_url(u)]
@@ -702,10 +725,10 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
                 else:
                     print(f" - {url}")
                     print("   Flags: (none)")
-        
+
     else:
         print(YELLOW + "\n[*] No URLs found in body." + RESET)
-    
+
     print()
 
     if auth_results_headers:
@@ -739,7 +762,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     # Parse received-spf
     received_spf_hdrs = msg.get_all("received-spf") or []
     # Set "has SPF Headers" flag
-    hasSPFHeaders = True if received_spf_hdrs else False
+    hasSPFHeaders = bool(received_spf_hdrs)
 
     # Rule:
     # - The first header is the most recent hop
@@ -755,7 +778,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
                 message=f"SPF status: {parsed_spf_hdr['result']}",
                 status=parsed_spf_hdr['result'],
             )
-    
+
     # Check for CrossTenant Headers
     crossTenant = has_crosstenant_headers(msg)
 
@@ -766,14 +789,24 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     print(f"Reply-To:       {reply_to_hdr!r}")
     print(f"Return-Path:    {return_path_hdr!r}")
     print()
-    print(f"Thread-Topic:   {thread_topic_hdr!r}")
+    if thread_topic_hdr:
+        print(f"Thread-Topic:   {thread_topic_hdr!r}")
     print(f"Subject:        {subject_hdr!r}")
     print(f"Date:           {date_hdr!r}")
+    if has_attachment_hdr:
+        print(f"Has Attachment: {has_attachment_hdr!r}")
     print()
-    print(f"Auth-Results:   {auth_results_headers!r}")
-    print()
+    if origin_IP_hdr:
+        print(f"Origin IP:      {origin_IP_hdr!r}")
+        print()
+    if auth_results_headers:
+        print(f"Auth-Results:   {auth_results_headers!r}")
+        print()
     print(f"Content-Type:     {content_type_hdr!r}")
-    print(f"Content-Language: {content_language_hdr!r}")
+    if content_language_hdr:
+        print(f"Content-Language: {content_language_hdr!r}")
+    if content_transfer_encode_hdr:
+        print(f"Content Transfer Encoding: {content_transfer_encode_hdr!r}")
     print()
     if hasSPFHeaders and parsed_spf_hdr['result'] == 'pass':
         print(f"{BRIGHT_GREEN}received-spf:{RESET}   {received_spf_hdrs[0]!r}")
@@ -783,11 +816,16 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     print(f"MIME-Version:   {mime_version_hdr!r}")
     print()
 
+    for r in received_from_hdr:
+        print(f"Received: {r}")
+
+    print()
+
     print(f"{CYAN}=== Parsed Domains ==={RESET}")
-    from_domain = get_domain_from_address(from_hdr)
-    to_domain = get_domain_from_address(to_hdr)
-    reply_to_domain = get_domain_from_address(reply_to_hdr)
-    return_path_domain = get_domain_from_address(return_path_hdr)
+    from_domain, from_display_name = get_domain_from_address(from_hdr)
+    to_domain, to_display_name = get_domain_from_address(to_hdr)
+    reply_to_domain, reply_to_display_name = get_domain_from_address(reply_to_hdr)
+    return_path_domain, return_path_display_name = get_domain_from_address(return_path_hdr)
 
     if crossTenant:
         add_finding(
@@ -795,7 +833,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
             category=Category.HEADERS,
             code=Code.CROSSTENANT_PRESENT,
             severity=Severity.INFO if from_domain != to_domain else Severity.HIGH,
-            message=f"Cross tenant headers detected for internal email.",
+            message="Cross tenant headers detected for internal email.",
             status=crossTenant,
         )
 
@@ -807,7 +845,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
             category=Category.HEADERS,
             code=Code.MISSING_HEADER,
             severity=Severity.HIGH,
-            message=f"From headers are missing! This is suspicious.",
+            message="From headers are missing! This is suspicious.",
             status=Code.MISSING_HEADER,
         )
     print(f"To domain:              {to_domain}")
@@ -824,13 +862,13 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
     # -------------------------------------------
 
     print(f"{CYAN}=== Parsed Sender Domain WHOIS ==={RESET}")
-    
+
     if show_spinners:
         whoisSpinner = Halo(text="Perfomring WHOIS lookup...", spinner="dots")
         whoisSpinner.start()
 
     whois_data = analyze_sender_rdap(from_domain, analysis_results)
-    
+
     if show_spinners:
         whoisSpinner.stop()
 
@@ -862,13 +900,13 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
         spinner.start()
 
     dns_results = extract_dns_records(from_domain)
-    
+
     if show_spinners:
         spinner.stop()
 
     for r in dns_results:
         print(f"- {r}")
-    
+
     print()
 
     # ----------------------------------------------------------------------
@@ -883,17 +921,17 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
 
     if auth_dmarc == 'fail':
         print(f"{RED}=== Email DMARC Failed Check ==={RESET}")
-        print(f"Emails that fail DMARC checking are more likely phishing emails.")
+        print("Emails that fail DMARC checking are more likely phishing emails.")
         print()
         add_finding(
                 analysis_results,
                 category=Category.DMARC,
                 code=Code.DMARC_FAIL,
                 severity=Severity.HIGH,
-                message=f"DMARC Failed Check",
+                message="DMARC Failed Check",
                 status=auth_dmarc,
             )
-        
+
     if from_domain == to_domain and hasSPFHeaders:
         if parsed_spf_hdr['result'] == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
             print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
@@ -903,7 +941,7 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
                 print(f"AuthAs -> {org_authAs_hdr}")
             if auth_dmarc == 'fail':
                 print(f"DMARC Check -> {auth_dmarc}")
-            
+
             print()
 
     if from_domain != to_domain:
@@ -913,34 +951,32 @@ def run_analysis(file_path: str, use_json: bool = False, show_spinners: bool = T
         print()
 
     # Print if no From Headers are found
-    if from_hdr == None:
+    if from_hdr is None:
         print(RED + '[-] No From Headers Found - Very suspicious!' + RESET)
 
-    # Print if no Auth Headers are found 
-    if hasAuthHeaders == False:
+    # Print if no Auth Headers are found
+    if hasAuthHeaders is False:
         print(YELLOW + '[*] No Authentication Headers Found' + RESET)
 
-    # Print if no SPF Headers are found 
-    if hasSPFHeaders == False:
+    # Print if no SPF Headers are found
+    if hasSPFHeaders is False:
         print(YELLOW + '[*] No SPF Headers Found' + RESET)
 
     # pretty-print JSON for now (CLI use)
     if use_json:
         print("\nJSON analysis results:")
         print(json.dumps({"analysis_results": analysis_results}, indent=2))
-    
+
     print(rf"""{BRIGHT_GREEN}
 ===============================================================================
    Analysis Complete: Please perform manual investigation to verify findings
 ===============================================================================
 {RESET}
 """)
-    
-    
 
 def run_analysis_and_pdf(file_path: str, pdf_path: str):
     analysis_results = []  # your existing findings list
-    
+
     metadata = {
         "file_name": file_path,
         "overall_verdict": "N/A",  # or whatever you compute
@@ -949,7 +985,7 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str):
     }
 
     # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False, metadata=metadata, pdf_path=pdf_path, analysis_results=analysis_results)
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
 
     email_body = get_email_body(file_path)
 
@@ -961,46 +997,9 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str):
         email_body=email_body
     )
 
-# def main():
-    
-#     print_banner()
-
-#     parser = argparse.ArgumentParser(
-#         description="Step 1: just parse and print basic email headers."
-#     )
-
-#     parser.add_argument(
-#         "-f", "--file",
-#         required=True,
-#         help="Path to a text file containing raw email headers.",
-#     )
-
-#     parser.add_argument(
-#         "-j", "--json",
-#         action="store_true",
-#         help="Include output of analysis_results as JSON"
-#     )
-
-#     # parser.add_argument(
-#     #     "--no-color",
-#     #     action="store_true",
-#     #     help="Disable ANSI color codes in output"
-#     # )
-
-#     args = parser.parse_args()
-
-#     run_analysis(args.file, use_json=args.json)
-#     # result_text = run_analysis_capture_text(args.file, use_json=True)
-#     # print(result_text)
-
-#     print(rf"""{BRIGHT_GREEN}
-# ===============================================================================
-#    Analysis Complete: Please perform manual investigation to verify findings
-# ===============================================================================
-# {RESET}
-# """)
-    
-def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi: bool = True, metadata: dict = {}, pdf_path: str = "", analysis_results: list = []) -> str:
+def run_analysis_capture_text(file_path: str,
+                              use_json: bool = False,
+                              strip_ansi: bool = True) -> str:
     """
     Run the analysis and capture the full terminal-style output
     as a single string, instead of printing it to the real terminal.
@@ -1016,74 +1015,29 @@ def run_analysis_capture_text(file_path: str, use_json: bool = False, strip_ansi
     output = buffer.getvalue()
     return ANSI_RE.sub("", output) if strip_ansi else output
 
-def analyze_sender_whois(domain: str, analysis_results):
-    whois_info = lookup_whois(domain)
+def analyze_sender_rdap(domain: str, analysis_results):
+    rdap = lookup_rdap(domain)
 
-    if not whois_info["success"]:
+    if not rdap["success"]:
         add_finding(
             analysis_results,
             category=Category.METADATA,
             code=Code.WHOIS_LOOKUP_FAILED,
             severity=Severity.LOW,
-            message=f"WHOIS lookup failed for domain {whois_info['domain']!r}",
-            error=whois_info["error"],
+            message=f"WHOIS lookup failed for domain {domain}",
+            error=rdap["error"],
         )
-        return
+        return None
 
-    # Example heuristics you can build on:
     add_finding(
         analysis_results,
         category=Category.METADATA,
         code=Code.WHOIS_BASIC_INFO,
         severity=Severity.INFO,
-        message=f"WHOIS data for {whois_info['domain']}",
-        registrar=whois_info["registrar"],
-        creation_date=whois_info["creation_date"],
-        expiration_date=whois_info["expiration_date"],
+        message=f"WHOIS data for {domain}",
+        registrar=rdap["registrar"],
+        creation_date=rdap["creation_date"],
+        expiration_date=rdap["expiration_date"],
     )
 
-def analyze_sender_rdap(domain: str, analysis_results):
-    rdap = lookup_rdap(domain)
-
-    if not rdap["success"]:
-        # add_finding(
-        #     analysis_results,
-        #     category=Category.METADATA,
-        #     code=Code.RDAP_LOOKUP_FAILED,   # add to your Enum
-        #     severity=Severity.LOW,
-        #     message=f"RDAP lookup failed for {rdap['domain']}",
-        #     error=rdap["error"],
-        # )
-        return
-
-    # Example info finding
-    # add_finding(
-    #     analysis_results,
-    #     category=Category.METADATA,
-    #     code=Code.RDAP_BASIC_INFO,
-    #     severity=Severity.INFO,
-    #     message=f"RDAP data for {rdap['domain']}",
-    #     registrar=rdap["registrar"],
-    #     creation_date=rdap["creation_date"],
-    #     expiration_date=rdap["expiration_date"],
-    #     domain_age_days=rdap["domain_age_days"],
-    # )
-
-    # Example heuristic: very young domain
-    # if rdap["domain_age_days"] is not None and rdap["domain_age_days"] < 30:
-    #     add_finding(
-    #         analysis_results,
-    #         category=Category.METADATA,
-    #         code=Code.RDAP_YOUNG_DOMAIN,
-    #         severity=Severity.HIGH,
-    #         message=(
-    #             f"Domain {rdap['domain']} appears to be very new "
-    #             f"({rdap['domain_age_days']} days old)"
-    #         ),
-    #     )
-
     return rdap
-
-# Run main
-# if __name__ == "__main__":
-    # main()

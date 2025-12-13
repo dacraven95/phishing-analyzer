@@ -31,6 +31,9 @@ phish-report-*
 phish-analyze.py
 reports/
 ignore-*
+# Don't track workflows for the time being
+.github/ 
+
 
 # ===========================================
 # Editor / OS Noise

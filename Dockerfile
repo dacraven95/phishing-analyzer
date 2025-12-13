@@ -24,6 +24,7 @@ COPY api_main.py ./api_main.py
 # Install the app and its runtime dependencies
 # (FastAPI, uvicorn, dnspython, python-multipart, etc. from pyproject.toml)
 RUN pip install --no-cache-dir .
+RUN python -m playwright install chromium
 
 # Expose API port
 EXPOSE 8000

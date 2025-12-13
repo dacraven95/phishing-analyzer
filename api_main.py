@@ -5,6 +5,8 @@ from fastapi.responses import FileResponse, JSONResponse
 import tempfile
 import os
 import traceback
+import asyncio
+
 from datetime import datetime
 
 from phish_analyzer.core import run_analysis_capture_text, run_analysis_and_pdf  # adjust import to match your structure
@@ -49,7 +51,7 @@ async def analyze_email(
         # 3) If PDF requested in the form field
         if create_pdf:
             pdf_path = os.path.join(os.getcwd(), "report.pdf")
-            run_analysis_and_pdf(tmp_path, pdf_path)
+            await asyncio.to_thread(run_analysis_and_pdf, tmp_path, pdf_path)
 
             return FileResponse(
                 path=pdf_path,

@@ -108,12 +108,12 @@ CrossTenant:        True
 
 ### 🔜 Coming Soon
 
-* HTML + text body extraction - COMPLETE
-* URL detection - COMPLETE
-* Domain reputation heuristics - IN PROGRESS
+* HTML + text body extraction - ✔
+* URL detection - ✔
+* Domain reputation heuristics - ✔
 * Suspicious content rule engine
 * LLM-based tone/intent scoring
-* FastAPI REST API endpoint - IN PROGRESS
+* FastAPI REST API endpoint - ✔
 * Full risk scoring engine (0–100)
 * JSON output mode
 

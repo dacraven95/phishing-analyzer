@@ -1,3 +1,7 @@
+"""
+Module for making WHOIS calls through the RDAP service
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone

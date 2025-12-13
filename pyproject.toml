@@ -1,6 +1,6 @@
 [project]
 name = "phish-analyzer"
-version = "0.4.2"
+version = "0.4.3"
 description = "Email phishing analysis tool"
 authors = [
     { name="DC", email="dacraven95@gmail.com" }
@@ -15,6 +15,8 @@ dependencies = [
     "reportlab>=4.0.0",
     "halo>=0.0.31",
     "requests>=2.32.0",
+    "playwright>=1.43,<2.0",
+    "Pillow>=10.0.0",
 ]
 
 [build-system]
@@ -23,3 +25,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["phish_analyzer"]
+
+[project.optional-dependencies]
+dev = [
+    "pylint>=3.0.0",
+]

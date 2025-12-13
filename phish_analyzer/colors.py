@@ -1,3 +1,7 @@
+"""
+This provides a list of colors used for coloring terminal output
+"""
+
 # ============================================
 # ANSI Color Codes for Terminal Output
 # ============================================
