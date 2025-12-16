@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
 from enum import Enum
 from datetime import datetime
+from typing import Any
 
 # Third party imports
 from halo import Halo
@@ -119,7 +120,7 @@ TRUSTED_BRAND_DOMAINS = {
 def print_banner():
     banner = r"""
 ===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.3
+   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.4
 ===================================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -635,6 +636,55 @@ def get_email_body(file_path):
 
     return email_body
 
+def get_headers(file_path, header: str = None):
+    
+    # Check if header was passed in and cancel if not
+    if header is None:
+        return
+    
+    # Get file extension
+    ext = get_file_extension(file_path)
+
+    headers = parse_detected_filetype(ext, file_path)
+    selected_hdr = headers.get_all(header) or []
+
+    return selected_hdr
+
+def get_header(file_path, header: str = None):
+    
+    # Check if header was passed in and cancel if not
+    if header is None:
+        return
+    
+    # Get file extension
+    ext = get_file_extension(file_path)
+
+    headers = parse_detected_filetype(ext, file_path)
+    selected_hdr = headers[header] or None
+
+    return selected_hdr
+
+_RX_FROM = re.compile(r"\bfrom\s+([^\s;]+)", re.IGNORECASE)
+_RX_BY = re.compile(r"\bby\s+([^\s;]+)", re.IGNORECASE)
+
+def parse_received_hops(received_headers: list[str]) -> list[dict[str, Any]]:
+    """
+    Turns Received headers into a list of hops. Very simple parsing:
+    - extracts 'from' host token and 'by' host token
+    - keeps raw line for reference
+    """
+    hops: list[dict[str, Any]] = []
+    for raw in received_headers:
+        from_m = _RX_FROM.search(raw)
+        by_m = _RX_BY.search(raw)
+        hops.append({
+            "from": from_m.group(1) if from_m else None,
+            "by": by_m.group(1) if by_m else None,
+            "raw": " ".join(raw.split()),  # compact whitespace
+        })
+    return hops
+
+
 def run_analysis(file_path: str,
                  use_json: bool = False,
                  show_spinners: bool = True):
@@ -653,31 +703,29 @@ def run_analysis(file_path: str,
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
 
-    # Check for file type .eml, .txt and parse message
-    msg = parse_detected_filetype(ext, file_path)
-
     # ----------------------------------------------------------
     # Pull Headers from Headers Block
     # ----------------------------------------------------------
 
-    received_from_hdr = msg.get_all("Received") or []
+    #received_from_hdr = msg.get_all("Received") or []
+    received_from_hdr = get_headers(file_path, "Received")
 
-    from_hdr = msg["From"] or None
-    to_hdr = msg["To"] or None
-    reply_to_hdr = msg["Reply-To"] or None
-    return_path_hdr = msg["Return-Path"] or None
-    date_hdr = msg["Date"] or None
-    subject_hdr = msg["Subject"] or None
-    mime_version_hdr = msg["MIME-Version"] or None
-    content_language_hdr = msg["Content-Language"] or None
-    content_type_hdr = msg["Content-Type"] or None
-    content_transfer_encode_hdr = msg["Content-Transfer-Encoding"] or None
-    thread_topic_hdr = msg["Thread-Topic"] or None
-    org_authAs_hdr = msg["X-MS-Exchange-Organization-AuthAs"] or None
-    has_attachment_hdr = msg["X-MS-Has-Attach"] or None
-    origin_IP_hdr = msg["X-Originating-IP"] or None
+    from_hdr = get_header(file_path, "From")
+    to_hdr = get_header(file_path, "To")
+    reply_to_hdr = get_header(file_path, "Reply-To")
+    return_path_hdr = get_header("Return-Path")
+    date_hdr = get_header("Date")
+    subject_hdr = get_header("Subject")
+    mime_version_hdr = get_header("MIME-Version")
+    content_language_hdr = get_header("Content-Language")
+    content_type_hdr = get_header("Content-Type")
+    content_transfer_encode_hdr = get_header("Content-Transfer-Encoding")
+    thread_topic_hdr = get_header("Thread-Topic")
+    org_authAs_hdr = get_header("X-MS-Exchange-Organization-AuthAs")
+    has_attachment_hdr = get_header("X-MS-Has-Attach")
+    origin_IP_hdr = get_header("X-Originating-IP")
 
-    auth_results_headers = msg.get_all("authentication-results") or []
+    auth_results_headers = get_headers(file_path,"authentication-results")
     hasAuthHeaders = bool(auth_results_headers)
     auth_spf = auth_dkim = auth_dmarc = None
 
@@ -685,12 +733,14 @@ def run_analysis(file_path: str,
     # END - Pull Headers from Headers Block
     # ----------------------------------------------------------
 
+    # Check for file type .eml, .txt and parse message
+    msg = parse_detected_filetype(ext, file_path)
+
     # Extract Email Body
     plain_body, html_body = extract_bodies(msg)
 
     # Extract URLs
     found_URLS = extract_urls_from_body(plain_body, html_body)
-
     url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
 
     if plain_body:
@@ -703,7 +753,9 @@ def run_analysis(file_path: str,
         print(RED + "\n[!] No body content found in this message." + RESET)
 
     if found_URLS:
-        print(CYAN + "\n=== URLs Found in Body ===" + RESET)
+        print()
+        print(YELLOW + "[*] URLs Found in Body" + RESET)
+        # print(CYAN + "\n=== URLs Found in Body ===" + RESET)
         # for url in found_URLS:
         #     print(" -", url)
 
@@ -760,7 +812,7 @@ def run_analysis(file_path: str,
 
 
     # Parse received-spf
-    received_spf_hdrs = msg.get_all("received-spf") or []
+    received_spf_hdrs = get_headers(file_path,"received-spf")
     # Set "has SPF Headers" flag
     hasSPFHeaders = bool(received_spf_hdrs)
 
@@ -977,24 +1029,33 @@ def run_analysis(file_path: str,
 def run_analysis_and_pdf(file_path: str, pdf_path: str):
     analysis_results = []  # your existing findings list
 
+    email_body = get_email_body(file_path)
+
+    # ... run your usual logic to fill analysis_results and capture text_output ...
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
+
+    hops = parse_received_hops(get_headers(file_path, "Received"))
+
+    # Example badge: mark the last hop as "Delivered"
+    if hops:
+        hops[0]["badges"] = [{"text": "DELIVERED", "level": "pass"}]  # top Received is usually most recent
+        hops[-1]["badges"] = [{"text": "SHIPPED", "level": ""}]
+
     metadata = {
         "file_name": file_path,
         "overall_verdict": "N/A",  # or whatever you compute
         "overall_score": "N/A",              # optional
         "analyzed_at": datetime.now(),
+        "email_body": email_body,
+        "received_hops": hops
     }
-
-    # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
-
-    email_body = get_email_body(file_path)
 
     generate_pdf_report(
         output_path=pdf_path,
         text_output=text_output,
         analysis_results=analysis_results,
         metadata=metadata,
-        email_body=email_body
+        # email_body=email_body
     )
 
 def run_analysis_capture_text(file_path: str,

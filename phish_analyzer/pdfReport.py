@@ -23,7 +23,7 @@ def generate_pdf_report(
     text_output: str,
     analysis_results: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    email_body: str | None = None,
+    # email_body: str | None = None,
 ) -> None:
     """
     Generate a PDF report for a phishing analysis run.
@@ -61,7 +61,15 @@ def generate_pdf_report(
     y -= 0.25 * inch
     y = _draw_summary_box(c, width, margins, y, analysis_results, metadata)
 
+    received_hops = (metadata or {}).get("received_hops") or []
+    # Reverse list so we have "first -> last" hops
+    received_hops = list(reversed(received_hops))
+    y = _draw_mail_flow_graph(c, received_hops, width, height, margins, y)
+
     html_png_path = None
+
+    email_body = metadata["email_body"] or None
+
     # Draw email body block
     if email_body:
 
@@ -117,11 +125,157 @@ def generate_pdf_report(
 
 # ------------ Internal helpers ------------
 
+def _badge_style(level: str):
+    level = (level or "").lower()
+    if level in ("fail", "high", "bad", "error"):
+        return colors.HexColor("#B91C1C"), colors.HexColor("#FEE2E2")  # red text, light red bg
+    if level in ("warn", "warning", "medium", "suspicious"):
+        return colors.HexColor("#92400E"), colors.HexColor("#FEF3C7")  # amber text, light amber bg
+    if level in ("pass", "ok", "good", "success"):
+        return colors.HexColor("#166534"), colors.HexColor("#DCFCE7")  # green text, light green bg
+    return colors.HexColor("#1F2937"), colors.HexColor("#E5E7EB")      # gray default
+
+
+def _draw_badge(c, x: float, y: float, text: str, level: str, *, font="Helvetica-Bold", size=8, pad_x=6, pad_y=3, radius=6):
+    """
+    Draw a pill badge whose top-left starts at (x, y). Returns (badge_w, badge_h).
+    Note: y is the top edge of the badge box.
+    """
+    fg, bg = _badge_style(level)
+
+    c.setFont(font, size)
+    text_w = c.stringWidth(text, font, size)
+    badge_w = text_w + pad_x * 2
+    badge_h = size + pad_y * 2
+
+    # background
+    c.setFillColor(bg)
+    c.setStrokeColor(bg)
+    c.roundRect(x, y - badge_h, badge_w, badge_h, radius=radius, stroke=1, fill=1)
+
+    # text
+    c.setFillColor(fg)
+    text_y = y - badge_h + (badge_h - size) / 2 + 1 # Font-aware vertical spacing in the badge
+    c.drawString(x + pad_x, text_y, text)
+
+    c.setFont("Helvetica", 9)
+
+    return badge_w, badge_h
+
+def _draw_mail_flow_graph(c, hops: list[dict], width: float, height: float, margins: dict, start_y: float) -> float:
+    """
+    Draws a simple vertical 'mail flow' diagram using Received hops.
+    Returns the new y position after drawing.
+    """
+    if not hops:
+        return start_y
+
+    left = margins["left"]
+    right = width - margins["right"]
+    usable_w = right - left
+
+    # Layout constants
+    box_w = usable_w
+    box_h = 0.55 * inch
+    gap = 0.18 * inch
+    arrow_h = 0.12 * inch
+    pad_x = 0.14 * inch
+
+    title_font = "Helvetica-Bold"
+    title_size = 12
+    text_font = "Helvetica"
+    text_size = 9
+
+    start_y -= 0.35 * inch
+
+    y = start_y
+
+    # Page break if needed
+    needed = (title_size * 1.4) + (len(hops) * (box_h + gap + arrow_h)) + 0.3 * inch
+    if y - needed < margins["bottom"] + 0.5 * inch:
+        c.showPage()
+        y = height - margins["top"] - 0.5 * inch
+
+    # Title
+    c.setFont(title_font, title_size)
+    c.drawString(left, y, "Mail Flow (Received header path)")
+    y -= 0.30 * inch
+
+    # Draw each hop as a box + arrow to next
+    c.setFont(text_font, text_size)
+
+    for i, hop in enumerate(hops):
+        frm = hop.get("from") or "unknown"
+        by = hop.get("by") or "unknown"
+        badges = hop.get("badges") or []
+
+        # Box background + border
+        c.setFillColor(colors.whitesmoke)
+        c.setStrokeColor(colors.lightgrey)
+        c.setLineWidth(1)
+        c.roundRect(left, y - box_h, box_w, box_h, radius=6, stroke=1, fill=1)
+
+        # Text inside box
+        c.setFillColor(colors.black)
+        line1 = f"{i+1}. from: {frm}"
+        line2 = f"    by:   {by}"
+
+        c.drawString(left + pad_x, y - 0.22 * inch, line1)
+        c.drawString(left + pad_x, y - 0.40 * inch, line2)
+
+        # Badges (right-aligned inside the box)
+        badge_x_right = left + box_w - pad_x
+        badge_top = y - 0.16 * inch  # near top of box
+        badge_gap = 0.06 * inch
+
+        # Draw from right to left so they stack neatly
+        for b in reversed(badges):
+            label = b.get("text", "").strip()
+            level = b.get("level", "info")
+            if not label:
+                continue
+
+            # measure badge width by drawing off-screen? easier: call draw then adjust based on returned width
+            # We'll draw at a provisional x, then adjust:
+            # Instead: estimate width using current font settings:
+            # We'll just call _draw_badge with x=0 to get width? it would draw.
+            # Better: compute width using stringWidth.
+            c.setFont("Helvetica-Bold", 8)
+            text_w = c.stringWidth(label, "Helvetica-Bold", 8)
+            badge_w = text_w + 6 * 2  # pad_x*2 from helper default (6)
+            x = badge_x_right - badge_w
+
+            _draw_badge(c, x, badge_top, label, level)
+            badge_x_right = x - badge_gap  # shift left for next badge
+
+        # Arrow (except after last)
+        y = y - box_h - gap
+        if i < len(hops) - 1:
+            mid_x = left + box_w / 2
+            c.setStrokeColor(colors.grey)
+            c.setLineWidth(1)
+            c.line(mid_x, y, mid_x, y - arrow_h)
+
+            # arrow head
+            c.line(mid_x, y - arrow_h, mid_x - 4, y - arrow_h + 4)
+            c.line(mid_x, y - arrow_h, mid_x + 4, y - arrow_h + 4)
+
+            y -= arrow_h
+
+    # spacing after block
+    return y - 0.25 * inch
+
 def is_html(email_body):
     if "<html" in email_body:
         return True
     else:
         return False
+
+def _ensure_space(c, y, needed, height, margins):
+    if y - needed < margins["bottom"] + 0.5 * inch:
+        c.showPage()
+        return height - margins["top"] - 0.5 * inch
+    return y
 
 def _draw_email_html_screenshot(c, png_path: str, width: float, height: float, margins: dict, start_y: float) -> float:
     """
@@ -149,7 +303,8 @@ def _draw_email_html_screenshot(c, png_path: str, width: float, height: float, m
     # text_y -= (0.12 * inch)             # extra breathing room
 
     # Reserve a reasonable height; you can tune this.
-    max_h = 4.5 * inch
+    available_h = (start_y - (margins["bottom"] + 0.5 * inch))
+    max_h = min(6.5 * inch, available_h)
     pad = 0.10 * inch
 
     # Page break if not enough space
@@ -396,7 +551,7 @@ def _draw_header(
     # Title
     c.setFont("Helvetica-Bold", 20)
     c.setFillColor(colors.black)
-    c.drawString(margins["left"], y, "Phish Analyzer Report")
+    c.drawString(margins["left"], y, "Phish Analyzer Report v0.4.4")
     y -= 0.3 * inch
 
     # Meta line 1
