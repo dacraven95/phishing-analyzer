@@ -1,7 +1,7 @@
-# 🛡️ Phish Analyzer  
+# 🛡️ Phishing Analyzer v0.4.4
 ### A lightweight command-line tool for analyzing email headers and identifying phishing indicators.
 
-Phish Analyzer helps security analysts, IT admins, and researchers inspect email headers for suspicious patterns such as SPF failures, domain mismatches, and cross-tenant indicators.  
+Phishing Analyzer helps security analysts, IT admins, and researchers inspect email headers for suspicious patterns such as SPF failures, domain mismatches, and cross-tenant indicators.  
 
 The project is intentionally built step-by-step, starting with header-only analysis and expanding toward full phishing detection (URLs, content scoring, LLM analysis, FastAPI API, etc.).
 
@@ -77,7 +77,19 @@ Or to generate the terminal output into a PDF report as your output:
 ```bash
 python cli.py -f email.eml -r -o my-report.pdf
 ```
-`Note: PDF generation is still a new feature and the report mainly just shows a formatted terminal output.`
+Note: `PDF generation is still a new feature and the report mainly just shows a formatted terminal output.`
+
+### Dockerbuild + Docker Compose
+
+You can build the docker container locally which exposes this tool as an API on your local network
+```bash
+docker build phish-analyzer-api .
+```
+
+The API has a single endpoint `<your-ip>:8000/analyze` which returns the entire terminal output or the PDF report document.
+
+The API docs are viewable at `<your-ip>:8000/docs` once you spin up the container.
+
 ---
 
 ## 📄 Example Output
