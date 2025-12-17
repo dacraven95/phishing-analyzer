@@ -630,10 +630,12 @@ def get_email_body(file_path):
 
     plain_body, html_body = extract_bodies(msg)
 
+    email_body = None
+
     if plain_body:
-        email_body = plain_body
+        email_body = plain_body or None
     if html_body:
-        email_body = html_body
+        email_body = html_body or None
 
     return email_body
 
@@ -727,7 +729,7 @@ def run_analysis(file_path: str,
     origin_IP_hdr = get_header("X-Originating-IP")
 
     auth_results_headers = get_headers(file_path,"authentication-results")
-    hasAuthHeaders = bool(auth_results_headers)
+    has_auth_headers = bool(auth_results_headers)
     auth_spf = auth_dkim = auth_dmarc = None
 
     # ----------------------------------------------------------
@@ -820,9 +822,11 @@ def run_analysis(file_path: str,
     # Rule:
     # - The first header is the most recent hop
     # - Earlier ones are historical and less relevant to final evaluation
+    parsed_spf_hdr = None
+
     if received_spf_hdrs:
         primary_spf_header = received_spf_hdrs[0]
-        parsed_spf_hdr = parse_received_spf(primary_spf_header)
+        parsed_spf_hdr = parse_received_spf(primary_spf_header) or None
         add_finding(
                 analysis_results,
                 category=Category.SPF,
@@ -833,7 +837,7 @@ def run_analysis(file_path: str,
             )
 
     # Check for CrossTenant Headers
-    crossTenant = has_crosstenant_headers(msg)
+    cross_tenant = has_crosstenant_headers(msg)
 
     # Output Analysis
     print(f"{CYAN}=== Raw Header Values ==={RESET}")
@@ -880,14 +884,14 @@ def run_analysis(file_path: str,
     reply_to_domain, reply_to_display_name = get_domain_from_address(reply_to_hdr)
     return_path_domain, return_path_display_name = get_domain_from_address(return_path_hdr)
 
-    if crossTenant:
+    if cross_tenant:
         add_finding(
             analysis_results,
             category=Category.HEADERS,
             code=Code.CROSSTENANT_PRESENT,
             severity=Severity.INFO if from_domain != to_domain else Severity.HIGH,
             message="Cross tenant headers detected for internal email.",
-            status=crossTenant,
+            status=cross_tenant,
         )
 
     print(f"From domain:            {from_domain}")
@@ -902,10 +906,10 @@ def run_analysis(file_path: str,
             status=Code.MISSING_HEADER,
         )
     print(f"To domain:              {to_domain}")
-    if from_domain != to_domain and crossTenant:
-        print(f"{BRIGHT_GREEN}Cross Tenant:           {crossTenant}{RESET}")
-    if from_domain == to_domain and crossTenant:
-        print(f"{BRIGHT_RED}Cross Tenant:           {crossTenant}{RESET}")
+    if from_domain != to_domain and cross_tenant:
+        print(f"{BRIGHT_GREEN}Cross Tenant:           {cross_tenant}{RESET}")
+    if from_domain == to_domain and cross_tenant:
+        print(f"{BRIGHT_RED}Cross Tenant:           {cross_tenant}{RESET}")
     print(f"Reply-To domain:        {reply_to_domain}")
     print(f"Return-Path domain:     {return_path_domain}")
     print()
@@ -1008,7 +1012,7 @@ def run_analysis(file_path: str,
         print(RED + '[-] No From Headers Found - Very suspicious!' + RESET)
 
     # Print if no Auth Headers are found
-    if hasAuthHeaders is False:
+    if has_auth_headers is False:
         print(YELLOW + '[*] No Authentication Headers Found' + RESET)
 
     # Print if no SPF Headers are found
