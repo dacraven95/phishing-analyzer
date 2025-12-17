@@ -32,7 +32,8 @@ phish-analyze.py
 reports/
 ignore-*
 # Don't track workflows for the time being
-.github/ 
+.github/
+webapp/
 
 
 # ===========================================

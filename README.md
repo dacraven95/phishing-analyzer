@@ -5,6 +5,8 @@ Phishing Analyzer helps security analysts, IT admins, and researchers inspect em
 
 The project is intentionally built step-by-step, starting with header-only analysis and expanding toward full phishing detection (URLs, content scoring, LLM analysis, FastAPI API, etc.).
 
+You can view a live web demo running at: [https://demo.phishing-analyzer.com/](https://demo.phishing-analyzer.com/) 
+
 ---
 
 ## 🚀 Features (Current)

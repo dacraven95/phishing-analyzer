@@ -119,9 +119,10 @@ TRUSTED_BRAND_DOMAINS = {
 
 def print_banner():
     banner = r"""
-===================================================================
-   PHISH ANALYZER - Email Header & Body Scanner - Version: 0.4.4
-===================================================================
+==================================================
+   PHISH ANALYZER - Email Header & Body Scanner
+   Version: 0.4.4
+==================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
 
@@ -1020,9 +1021,10 @@ def run_analysis(file_path: str,
         print(json.dumps({"analysis_results": analysis_results}, indent=2))
 
     print(rf"""{BRIGHT_GREEN}
-===============================================================================
-   Analysis Complete: Please perform manual investigation to verify findings
-===============================================================================
+==================================================
+   Analysis Complete: Please perform manual
+   investigation to verify findings
+==================================================
 {RESET}
 """)
 
