@@ -42,13 +42,13 @@ Flags mismatches that often occur in phishing emails.
 - `.gitignore` included to prevent committing sensitive `.eml` or header samples.
 
 ### ✔ Browser Extension Available
-- You can download the `phish-analyzer-sidebar-packed.zip` file and unzip it to use as a browser sidebar extension.
+You can download the `phish-analyzer-sidebar-packed.zip` file and unzip it to use as a browser sidebar extension.
 * Unzip to a local folder (e.g. MyAwesomeChromeExtension)
 * open `chrome://extensions` or `brave://extensions` and enable "developer mode"
 * click on "load unpacked" and point to unzipped folder
 * enable extension if needed.
 * Open extension from the extension menu of browser
-- Can point extension to your own local copy of the phishing-analyzer API `(default is the live demo API)`
+Can point extension to your own local copy of the phishing-analyzer API `(default is the live demo API)`
 
 ---
 
