@@ -47,6 +47,7 @@ Thumbs.db
 # ===========================================
 .vscode/
 .code-workspace
+phish-analyzer-sidebar/
 
 # ===========================================
 # Logs
