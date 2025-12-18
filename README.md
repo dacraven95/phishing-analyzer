@@ -48,6 +48,7 @@ You can download the `phish-analyzer-sidebar-packed.zip` file and unzip it to us
 * click on "load unpacked" and point to unzipped folder
 * enable extension if needed.
 * Open extension from the extension menu of browser
+
 Can point extension to your own local copy of the phishing-analyzer API `(default is the live demo API)`
 
 ---
