@@ -32,6 +32,8 @@ from phish_analyzer.rdapHelper import lookup_rdap
 from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED
 from .pdfReport import generate_pdf_report
 
+BASE_DIR = Path(__file__).resolve().parent
+
 class Category(str, Enum):
     HEADERS = "headers"
     SPF = "spf"
@@ -118,11 +120,25 @@ TRUSTED_BRAND_DOMAINS = {
     # add domains here as needed
 }
 
+VERSION = None
+
+def get_version():
+    global  VERSION
+    if VERSION is None:
+        version_file = BASE_DIR / 'config' / 'version.txt'
+        try:
+            with open(version_file, 'r') as vf:
+                VERSION = vf.read().strip()
+        except FileNotFoundError:
+            VERSION = "unknown"
+    return VERSION
+
 def print_banner():
-    banner = r"""
+
+    banner = rf"""
 ==================================================
    PHISH ANALYZER - Email Header & Body Scanner
-   Version: 0.4.5
+   Version: {get_version()}
 ==================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -922,7 +938,6 @@ def run_analysis(file_path: str,
     print(f"Return-Path domain:     {return_path_domain}")
     print()
 
-    BASE_DIR = Path(__file__).resolve().parent
     WHITELIST_PATH = BASE_DIR / 'config' / 'domain-whitelist.txt'
 
     # Load up DNS whitelist for domains to skip WHOIS checks for: yourcompanydomain.com, etc.

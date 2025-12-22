@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -15,6 +16,9 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 
 from phish_analyzer.html_render import render_html_to_png
+
+BASE_DIR = Path(__file__).resolve().parent
+VERSION = None
 
 # ------------ Public API ------------
 
@@ -558,7 +562,7 @@ def _draw_header(
     # Title
     c.setFont("Helvetica-Bold", 20)
     c.setFillColor(colors.black)
-    c.drawString(margins["left"], y, "Phish Analyzer Report v0.4.4")
+    c.drawString(margins["left"], y, f"Phish Analyzer Report v{get_version()}")
     y -= 0.3 * inch
 
     # Meta line 1
@@ -846,3 +850,15 @@ def _draw_terminal_panel_background(
         stroke=1,
         fill=1,
     )
+
+
+def get_version():
+    global  VERSION
+    if VERSION is None:
+        version_file = BASE_DIR / 'config' / 'version.txt'
+        try:
+            with open(version_file, 'r') as vf:
+                VERSION = vf.read().strip()
+        except FileNotFoundError:
+            VERSION = "unknown"
+    return VERSION
