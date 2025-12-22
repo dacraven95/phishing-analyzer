@@ -86,6 +86,10 @@ def generate_pdf_report(
             # Space before email render block
             y -= 0.5 * inch
 
+            min_readable_img_h = 4.25 * inch
+
+            y = _ensure_space(c, y, min_readable_img_h, height, margins)
+
             y = _draw_email_html_screenshot(
                 c,
                 png_path=html_png_path,
@@ -271,10 +275,10 @@ def is_html(email_body):
     else:
         return False
 
-def _ensure_space(c, y, needed, height, margins):
-    if y - needed < margins["bottom"] + 0.5 * inch:
+def _ensure_space(c, y, needed, height, margins, pad=0.5*inch):
+    if y - needed < margins["bottom"] + pad:
         c.showPage()
-        return height - margins["top"] - 0.5 * inch
+        return height - margins["top"] - pad
     return y
 
 def _draw_email_html_screenshot(c, png_path: str, width: float, height: float, margins: dict, start_y: float) -> float:
@@ -454,6 +458,9 @@ def _ansi_color_for_code(code: str):
 
     # Fallback
     return colors.lawngreen
+
+def _new_page_y(page_h, margins, pad=0.25*inch):
+    return page_h - margins["top"] - pad
 
 def _wrap_text_lines(text: str, max_width: float, font_name: str, font_size: float) -> list[str]:
     """

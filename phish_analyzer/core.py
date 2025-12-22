@@ -19,6 +19,7 @@ from urllib.parse import urlparse, urlunparse
 from enum import Enum
 from datetime import datetime
 from typing import Any
+from pathlib import Path
 
 # Third party imports
 from halo import Halo
@@ -121,7 +122,7 @@ def print_banner():
     banner = r"""
 ==================================================
    PHISH ANALYZER - Email Header & Body Scanner
-   Version: 0.4.4
+   Version: 0.4.5
 ==================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
@@ -206,11 +207,18 @@ def extract_bodies(msg):
             elif ctype == "text/html" and html_body is None:
                 html_body = part.get_content()
     else:
+
+        content = msg.get_content()
+        if isinstance(content, bytes):
+            content_str = content.decode(errors="ignore")
+        else:
+            content_str = content or ""
+
         # Single-part message
         ctype = msg.get_content_type()
-        if ctype == "text/plain":
+        if ctype == "text/plain" and "<html" not in content_str.lower():
             plain_body = msg.get_content()
-        elif ctype == "text/html":
+        elif ctype == "text/html" or "<html" in content_str.lower():
             html_body = msg.get_content()
 
     return plain_body, html_body
@@ -914,57 +922,67 @@ def run_analysis(file_path: str,
     print(f"Return-Path domain:     {return_path_domain}")
     print()
 
-    # -------------------------------------------
-    # Analyze WHOIS for Sending Domain
-    # -------------------------------------------
+    BASE_DIR = Path(__file__).resolve().parent
+    WHITELIST_PATH = BASE_DIR / 'config' / 'domain-whitelist.txt'
 
-    print(f"{CYAN}=== Parsed Sender Domain WHOIS ==={RESET}")
+    # Load up DNS whitelist for domains to skip WHOIS checks for: yourcompanydomain.com, etc.
+    with open(WHITELIST_PATH, 'r') as f:
+        lines = f.read().splitlines()
 
-    if show_spinners:
-        whoisSpinner = Halo(text="Perfomring WHOIS lookup...", spinner="dots")
-        whoisSpinner.start()
-
-    whois_data = analyze_sender_rdap(from_domain, analysis_results)
-
-    if show_spinners:
-        whoisSpinner.stop()
-
-    if whois_data:
-        print(f"Domain:                 {whois_data['domain']}")
-        print(f"Domain Registrar:       {whois_data['registrar']}")
-        print(f"Domain Age:             {whois_data['domain_age_days']}")
-        if whois_data['domain_age_days'] <= 180:
-            print(RED + '[-] Domain is newly registered' + RESET)
-        if whois_data['domain_age_days'] <= 365 and whois_data['domain_age_days'] > 180:
-            print(YELLOW + '[*] Domain is young' + RESET)
-        print(f"Creation Date:          {whois_data['creation_date']}")
-        print(f"Expiration Date:        {whois_data['expiration_date']}")
-        print(f"Updated Date:           {whois_data['updated_date']}")
+    if from_domain in lines:
+        print(YELLOW + "[*] Domain is in whitelist, skipping unneccesary WHOIS & DNS Records lookup" + RESET)
         print()
-        print(f"Nameserver:             {whois_data['name_servers']}")
     else:
-        print(YELLOW + "[*] Could not lookup WHOIS information" + RESET)
+        # -------------------------------------------
+        # Analyze WHOIS for Sending Domain
+        # -------------------------------------------
+        print(f"{CYAN}=== Parsed Sender Domain WHOIS ==={RESET}")
 
-    print()
+        if show_spinners:
+            whoisSpinner = Halo(text="Perfomring WHOIS lookup...", spinner="dots")
+            whoisSpinner.start()
 
-    # ----------------------------------------------------------------------
-    # Output DNS Records for Sending Domain
-    # ----------------------------------------------------------------------
-    print(f"{CYAN}=== Parsed Sender DNS Records ==={RESET}")
+        whois_data = analyze_sender_rdap(from_domain, analysis_results)
 
-    if show_spinners:
-        spinner = Halo(text="Querying DNS Records...", spinner="dots2")
-        spinner.start()
+        if show_spinners:
+            whoisSpinner.stop()
 
-    dns_results = extract_dns_records(from_domain)
+        if whois_data:
+            print(f"Domain:                 {whois_data['domain']}")
+            print(f"Domain Registrar:       {whois_data['registrar']}")
+            print(f"Domain Age:             {whois_data['domain_age_days']}")
+            if whois_data['domain_age_days'] <= 180:
+                print(RED + '[-] Domain is newly registered' + RESET)
+            if whois_data['domain_age_days'] <= 365 and whois_data['domain_age_days'] > 180:
+                print(YELLOW + '[*] Domain is young' + RESET)
+            print(f"Creation Date:          {whois_data['creation_date']}")
+            print(f"Expiration Date:        {whois_data['expiration_date']}")
+            print(f"Updated Date:           {whois_data['updated_date']}")
+            print()
+            print(f"Nameserver:             {whois_data['name_servers']}")
+        else:
+            print(YELLOW + "[*] Could not lookup WHOIS information" + RESET)
 
-    if show_spinners:
-        spinner.stop()
+        print()
 
-    for r in dns_results:
-        print(f"- {r}")
+        # ----------------------------------------------------------------------
+        # Output DNS Records for Sending Domain
+        # ----------------------------------------------------------------------
+        print(f"{CYAN}=== Parsed Sender DNS Records ==={RESET}")
 
-    print()
+        if show_spinners:
+            spinner = Halo(text="Querying DNS Records...", spinner="dots2")
+            spinner.start()
+
+        dns_results = extract_dns_records(from_domain)
+
+        if show_spinners:
+            spinner.stop()
+
+        for r in dns_results:
+            print(f"- {r}")
+
+        print()
 
     # ----------------------------------------------------------------------
     # Output Authentication Header Results
@@ -993,12 +1011,11 @@ def run_analysis(file_path: str,
         if parsed_spf_hdr['result'] == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
             print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
             if parsed_spf_hdr['result'] == "fail" or auth_spf == 'fail':
-                print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']}")
+                print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']} for domain -> {from_domain}")
             if org_authAs_hdr == "Anonymous":
                 print(f"AuthAs -> {org_authAs_hdr}")
             if auth_dmarc == 'fail':
                 print(f"DMARC Check -> {auth_dmarc}")
-
             print()
 
     if from_domain != to_domain:

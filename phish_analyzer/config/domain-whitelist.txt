@@ -1,0 +1,10 @@
+example.com
+anotherexample.com
+gmail.com
+yahoo.com
+outlook.com
+comcast.net
+hotmail.com
+icloud.com
+protonmail.com
+proton.me

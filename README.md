@@ -1,11 +1,11 @@
-# 🛡️ Phishing Analyzer v0.4.4
+# 🛡️ Phishing Analyzer v0.4.5
 ### A lightweight command-line tool for analyzing email headers and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect email headers for suspicious patterns such as SPF failures, domain mismatches, and cross-tenant indicators.  
 
 The project is intentionally built step-by-step, starting with header-only analysis and expanding toward full phishing detection (URLs, content scoring, LLM analysis, FastAPI API, etc.).
 
-You can view a live web demo running at: [https://demo.phishing-analyzer.com/](https://demo.phishing-analyzer.com/) 
+You can view a live web demo running at: [https://demo.phishing-analyzer.com/](https://demo.phishing-analyzer.com/) `The demo's analyzer version may differ from current version`
 
 ---
 
@@ -37,6 +37,11 @@ Flags mismatches that often occur in phishing emails.
 ### ✔ Terminal Output Enhancements
 - Colored output using ANSI escape codes.
 - Optional ASCII banner at startup.
+
+### ✔ PDF Output
+- Easy to read PDF which includes terminal output
+- Can return the PDF via the API for automated workflows
+- PDF generation uses `-r` via `cli.py` or by setting `create_pdf = True` in API body
 
 ### ✔ Safe for GitHub
 - `.gitignore` included to prevent committing sensitive `.eml` or header samples.
