@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.4.5
+# 🛡️ Phishing Analyzer v0.4.6
 ### A lightweight command-line tool for analyzing email headers and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect email headers for suspicious patterns such as SPF failures, domain mismatches, and cross-tenant indicators.  
@@ -117,6 +117,11 @@ The API docs are viewable at `<your-ip>:8000/docs` once you spin up the containe
 ===========================================
 
 [+] Detected EML file
+
+[+] Email attachments detected
+- {'filename': 'bad-attachment.virus', 'content_type': 'text/plain', 'size': 1234}
+-- Potentially risky filetype detected => .virus
+
 From:        "Example Sender" <alerts@sample.com>
 Reply-To:    noreply@marketing-platform.com>
 Return-Path: <bounce@mailer.sendgrid.net>
@@ -145,6 +150,7 @@ CrossTenant:        True
 * FastAPI REST API endpoint - ✔
 * Full risk scoring engine (0–100)
 * JSON output mode
+* Email attachment(s) analysis
 
 ---
 
