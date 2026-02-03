@@ -11,9 +11,11 @@ import json
 import io
 import contextlib
 
-from email import message_from_string
+from email import message_from_string, policy
 from email.policy import default as default_policy
 from email.utils import parseaddr
+from email.message import Message
+from email.parser import BytesParser
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
 from enum import Enum
@@ -142,6 +144,10 @@ def print_banner():
 ==================================================
 """
     print(BRIGHT_GREEN + banner + RESET)
+
+def load_email(path):
+    with open(path, "rb") as f:
+        return BytesParser(policy=policy.default).parse(f)
 
 def add_finding(results_list,
                 category: Category,
@@ -712,6 +718,38 @@ def parse_received_hops(received_headers: list[str]) -> list[dict[str, Any]]:
     return hops
 
 
+def has_attachment(msg: Message) -> bool:
+    """
+    Return True if the email message contains at least one attachment.
+    """
+    for part in msg.walk():
+        # Skip container parts
+        if part.is_multipart():
+            continue
+
+        # Explicit attachment
+        if part.get_content_disposition() == "attachment":
+            return True
+
+        # Some attachments are marked inline but still have filenames
+        if part.get_filename():
+            return True
+
+    return False
+
+def list_attachments(msg: Message):
+    files = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_disposition() == "attachment" or part.get_filename():
+            files.append({
+                "filename": part.get_filename(),
+                "content_type": part.get_content_type(),
+                "size": len(part.get_payload(decode=True) or b""),
+            })
+    return files
+
 def run_analysis(file_path: str,
                  use_json: bool = False,
                  show_spinners: bool = True):
@@ -723,9 +761,40 @@ def run_analysis(file_path: str,
     # Get file extension
     ext = get_file_extension(file_path)
 
+    # Load message for later
+    message = load_email(file_path)
+
     if ext == '.eml':
-        print(GREEN + "[+] Detected EML file" + RESET)
+        print(BRIGHT_GREEN + "[+] Detected EML file" + RESET)
         print()
+
+        attachments = list_attachments(message)
+        has_any = bool(attachments)
+
+        RISKY_EXT = {
+            ".exe",".msi",".msp",".scr",".com",".bat",".cmd",".ps1",".vbs",".js",".jse",
+            ".lnk",".scf",".url",".pif",
+            ".html",".htm",".xhtml",".mhtml",".mht",".shtml",
+            ".docm",".xlsm",".pptm",
+            ".zip",".rar",".7z",".iso",".img",".cab",".tar",".gz",".bz2",
+            ".hta",".jar",".reg",".dll",".sys",".apk",".dmg"
+        }
+
+        if has_any:
+            print(YELLOW + "[+] Email attachments detected" + RESET)
+            for attachment in attachments:
+                print(YELLOW + f"- {attachment}" + RESET)
+                attach_ext = Path(attachment["filename"]).suffix.lower()
+                suffixes = Path(attachment["filename"]).suffixes
+                if len(suffixes) == 1:
+                    if attach_ext in RISKY_EXT:
+                        print(RED + "Potentially risky filetype detected => " + attach_ext)
+                    else:
+                        print(YELLOW + f"-- {attach_ext}" + RESET)
+                else:
+                    print(RED + f"-- {suffixes} <= Multiple file suffixes detected" + RESET)
+            print()
+
     else:
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
