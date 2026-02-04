@@ -1,9 +1,9 @@
-# 🛡️ Phishing Analyzer v0.4.6
-### A lightweight command-line tool for analyzing email headers and identifying phishing indicators.
+# 🛡️ Phishing Analyzer v0.4.7
+### A lightweight command-line tool for analyzing email headers, email attachments, and identifying phishing indicators.
 
-Phishing Analyzer helps security analysts, IT admins, and researchers inspect email headers for suspicious patterns such as SPF failures, domain mismatches, and cross-tenant indicators.  
+Phishing Analyzer helps security analysts, IT admins, and researchers inspect emails' attachments and headers for suspicious patterns such as SPF failures, domain mismatches, suspicious filetypes, and cross-tenant indicators.  
 
-The project is intentionally built step-by-step, starting with header-only analysis and expanding toward full phishing detection (URLs, content scoring, LLM analysis, FastAPI API, etc.).
+The project is intentionally built step-by-step, starting with header-only analysis and expanding toward full phishing detection (URLs, content scoring, attachment analysis, LLM analysis, FastAPI API, etc.).
 
 You can view a live web demo running at: [https://demo.phishing-analyzer.com/](https://demo.phishing-analyzer.com/) `The demo's analyzer version may differ from current version`
 
@@ -14,6 +14,11 @@ You can view a live web demo running at: [https://demo.phishing-analyzer.com/](h
 ### ✔ Email Header Parsing
 - Supports both **raw header text files** and full **`.eml`** email files.
 - Automatically extracts the header block even if extra text appears before/after.
+
+### ✔ Basic Email Attachment Analysis (upgrades coming soon)
+- Analyzes attachments based on **actual content**, not filenames alone.
+- Detects **embedded scripts**, inline SVG, and hidden active payloads.
+- Flags **obfuscated JavaScript loaders** commonly used in phishing emails.
 
 ### ✔ SPF Analysis
 - Parses **multiple `Received-SPF` headers**.

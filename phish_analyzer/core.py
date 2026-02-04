@@ -3,13 +3,16 @@
 """
 Core module for processing the email files for analysis
 """
-
+from __future__ import annotations
 import os
 import re
+import math
+import zipfile
 import ipaddress
 import json
 import io
 import contextlib
+import mimetypes
 
 from email import message_from_string, policy
 from email.policy import default as default_policy
@@ -20,7 +23,9 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse
 from enum import Enum
 from datetime import datetime
-from typing import Any
+from typing import Any, List, Dict, Optional, Tuple
+
+from dataclasses import dataclass
 from pathlib import Path
 
 # Third party imports
@@ -31,7 +36,7 @@ import dns.resolver
 from phish_analyzer.rdapHelper import lookup_rdap
 
 # Local imports
-from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED
+from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE
 from .pdfReport import generate_pdf_report
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -112,6 +117,72 @@ BRAND_KEYWORDS = [
     "paypal", "microsoft", "office365", "outlook", "apple", "google",
     "amazon", "bankofamerica", "chase", "wellsfargo"
 ]
+
+RISKY_EXTENSION_REASONS = {
+    # Executables & installers
+    ".exe": "Executable files can directly run malware when opened.",
+    ".msi": "Windows installer packages can silently install malicious software.",
+    ".msp": "Installer patch files can modify software to introduce malware.",
+    ".scr": "Screen saver files are executable binaries commonly abused for malware delivery.",
+    ".com": "Legacy executable format that runs immediately on open.",
+    ".bat": "Batch scripts can automatically run multiple malicious system commands.",
+    ".cmd": "Command scripts capable of executing system-level operations.",
+    ".ps1": "PowerShell scripts can download, execute, and persist malware stealthily.",
+    ".vbs": "VBScript files are frequently used as malware droppers.",
+    ".js": "JavaScript files can execute malicious code outside of a browser.",
+    ".jse": "Encoded JavaScript used to evade detection and analysis.",
+
+    # Shortcuts & redirection
+    ".lnk": "Shortcut files can hide malicious commands behind legitimate-looking icons.",
+    ".scf": "Explorer command files can execute code when viewed in Windows Explorer.",
+    ".url": "Internet shortcut files can redirect users to credential-harvesting websites.",
+    ".pif": "Legacy shortcut format that can execute hidden programs.",
+
+    # HTML & web-based phishing
+    ".html": "HTML attachments commonly contain fake login pages designed to steal credentials.",
+    ".htm": "HTML attachments are often used to deliver credential-harvesting pages.",
+    ".xhtml": "Web document format capable of embedding scripts and phishing forms.",
+    ".mhtml": "Archived web pages that may contain embedded malicious scripts.",
+    ".mht": "Web archive format frequently used to bypass email filtering controls.",
+    ".shtml": "HTML files that may contain embedded executable or scripted content.",
+
+    # Office macro files
+    ".docm": "Macro-enabled Word documents can execute malicious code.",
+    ".xlsm": "Macro-enabled Excel files are commonly used to deliver malware.",
+    ".pptm": "Macro-enabled PowerPoint files can execute malicious scripts.",
+
+    # Compressed & container formats
+    ".zip": "Compressed archives are often used to hide malicious payloads.",
+    ".rar": "Archive files commonly abused to conceal malware.",
+    ".7z": "Highly compressed archives that can evade content scanning.",
+    ".iso": "Disk image files can contain executables that bypass security controls.",
+    ".img": "Disk image files capable of mounting malicious content.",
+    ".cab": "Windows cabinet files used to package and distribute malware.",
+    ".tar": "Archive format that can hide malicious files.",
+    ".gz": "Compressed files often used to conceal malware.",
+    ".bz2": "Compression format sometimes used to evade detection.",
+
+    # Scripts & automation
+    ".hta": "HTML applications execute with full user privileges.",
+    ".jar": "Java archives can execute malicious code across platforms.",
+    ".py": "Python scripts can perform automated malicious actions.",
+
+    # System & platform-specific
+    ".reg": "Registry files can modify system settings to enable persistence or disable security.",
+    ".dll": "Dynamic link libraries can be loaded by malicious programs.",
+    ".sys": "System driver files can operate at kernel level if malicious.",
+    ".apk": "Android application packages commonly used to distribute mobile malware.",
+    ".dmg": "macOS disk images capable of delivering malicious applications."
+}
+
+# RISKY_EXT = {
+#             ".exe",".msi",".msp",".scr",".com",".bat",".cmd",".ps1",".vbs",".js",".jse",
+#             ".lnk",".scf",".url",".pif",
+#             ".html",".htm",".xhtml",".mhtml",".mht",".shtml",
+#             ".docm",".xlsm",".pptm",
+#             ".zip",".rar",".7z",".iso",".img",".cab",".tar",".gz",".bz2",
+#             ".hta",".jar",".reg",".dll",".sys",".apk",".dmg"
+#         }
 
 # optional: known-good company domains (can expand later)
 TRUSTED_BRAND_DOMAINS = {
@@ -750,6 +821,253 @@ def list_attachments(msg: Message):
             })
     return files
 
+def extract_attachments(msg):
+    attachments = []
+
+    for part in msg.iter_attachments():
+        filename = part.get_filename()
+        if not filename:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        attachments.append({
+            "filename": filename,
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+            "payload": payload  # raw bytes
+        })
+
+    return attachments
+
+def analyze_attachment(att, content_bytes=None):
+    path = Path(att["filename"])
+    
+    return {
+        "filename": att["filename"],
+        "extension": path.suffix.lower(),
+        "all_extensions": path.suffixes,
+        "declared_mime": att.get("content_type"),
+        "guessed_mime": mimetypes.guess_type(att["filename"])[0],
+        "suspicious": len(path.suffixes) > 1
+    }
+
+@dataclass
+class Finding:
+    code: str
+    weight: int
+    message: str
+    evidence: Optional[str] = None
+
+def shannon_entropy(data: bytes, max_len: int = 200_000) -> float:
+    data = data[:max_len]
+    if not data:
+        return 0.0
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    ent = 0.0
+    n = len(data)
+    for c in freq:
+        if c:
+            p = c / n
+            ent -= p * math.log2(p)
+    return ent
+
+def detect_magic(data: bytes) -> str:
+    # very small signature set, expand as needed
+    if data.startswith(b"MZ"):
+        return "pe_executable"
+    if data.startswith(b"%PDF-"):
+        return "pdf"
+    if data.startswith(b"PK\x03\x04"):
+        return "zip"
+    if data.startswith(b"{\\rtf"):
+        return "rtf"
+    if data.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        return "ole2"
+    return "unknown"
+
+RLO_CHARS = {"\u202E", "\u202D", "\u2066", "\u2067", "\u2068", "\u2069"}
+
+SVG_BLOCK_RE = re.compile(r"<svg\b.*?</svg>", flags=re.I | re.S)
+SCRIPT_BLOCK_RE = re.compile(r"<script\b.*?</script>", flags=re.I | re.S)
+
+# crude but effective for embedded long base64 blobs
+BASE64_LONG_RE = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
+
+def _html_sniff(data: bytes) -> str:
+    return data[:300_000].decode("utf-8", errors="ignore")
+
+def _extract_inline_svgs(html_text: str) -> List[str]:
+    return SVG_BLOCK_RE.findall(html_text)
+
+def _svg_script_obfuscation_findings(svg_text_lower: str) -> List[Finding]:
+    f: List[Finding] = []
+
+    # SVG + script is already a big deal
+    if "<script" in svg_text_lower:
+        f.append(Finding("svg_script", 55, "Inline SVG contains <script> (active scripting inside embedded SVG)."))
+
+        # Obfuscation / execution indicators
+        if "cdata" in svg_text_lower:
+            f.append(Finding("svg_cdata", 5, "SVG script uses CDATA wrapper (common in weaponized SVG)."))
+        if "atob" in svg_text_lower or "fromcharcode" in svg_text_lower:
+            f.append(Finding("svg_base64_decode", 15, "SVG script performs Base64 decoding (atob/fromCharCode), consistent with obfuscation."))
+        if "constructor" in svg_text_lower:
+            f.append(Finding("svg_function_ctor", 20, "SVG script references constructor (Function constructor abuse pattern)."))
+        if "return eval" in svg_text_lower or "eval(" in svg_text_lower:
+            f.append(Finding("svg_eval", 25, "SVG script uses eval (dynamic code execution)."))
+        # XOR-ish decrypt loop signals
+        if "charcodeat" in svg_text_lower and "^" in svg_text_lower:
+            f.append(Finding("svg_xor_decrypt", 20, "SVG script shows XOR decrypt loop pattern (charCodeAt + ^), consistent with staged payload decryption."))
+        if BASE64_LONG_RE.search(svg_text_lower):
+            f.append(Finding("svg_long_base64_blob", 10, "SVG script contains long Base64-like blob(s), likely hidden payload."))
+
+    return f
+
+def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
+                             risky_ext_reasons: Dict[str, str]) -> Tuple[int, List[Finding]]:
+    findings: List[Finding] = []
+    path = Path(filename)
+    suffixes = [s.lower() for s in path.suffixes]
+    last_ext = suffixes[-1] if suffixes else ""
+
+    # 1) Filename tricks
+    if any(ch in filename for ch in RLO_CHARS):
+        findings.append(Finding("unicode_direction_override", 25,
+                                "Filename contains Unicode directionality characters often used to disguise extensions."))
+
+    if len(suffixes) > 1:
+        findings.append(Finding("multi_extension", 15,
+                                "Filename has multiple extensions, a common disguise technique.",
+                                evidence="".join(suffixes)))
+
+    for ext in suffixes:
+        if ext in risky_ext_reasons:
+            findings.append(Finding("risky_extension", 30,
+                                    f"Potentially risky filetype detected => {ext}",
+                                    evidence=risky_ext_reasons[ext]))
+            break  # keep it simple; or keep all matches
+
+    # 2) Magic / type sniff
+    magic = detect_magic(data)
+    findings.append(Finding("magic_type", 0, f"Detected file signature: {magic}"))
+
+    # 3) MIME mismatch (best-effort)
+    # declared_mime might be wrong; still useful as a signal
+    if declared_mime:
+        if magic == "pdf" and "pdf" not in declared_mime.lower():
+            findings.append(Finding("mime_mismatch", 20, "Declared MIME type doesn't match detected PDF signature.",
+                                    evidence=f"declared={declared_mime}"))
+        if magic == "zip" and "zip" not in declared_mime.lower() and "officedocument" not in declared_mime.lower():
+            findings.append(Finding("mime_mismatch", 20, "Declared MIME type doesn't match detected ZIP signature.",
+                                    evidence=f"declared={declared_mime}"))
+
+    # 4) ZIP inspection (covers OOXML + zipped droppers)
+    if magic == "zip":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                names = [n.lower() for n in z.namelist()]
+
+                # Macro in OOXML
+                if any("vbaproject.bin" in n for n in names):
+                    findings.append(Finding("office_macro", 60,
+                                            "Office document appears to contain macros (vbaProject.bin), a common malware vector."))
+
+                # Dangerous contents
+                dangerous_members = [n for n in names if n.endswith((".exe",".js",".vbs",".ps1",".lnk",".scr",".bat",".cmd",".hta"))]
+                if dangerous_members:
+                    findings.append(Finding("zip_dangerous_members", 70,
+                                            "Archive contains potentially executable/script files.",
+                                            evidence=", ".join(dangerous_members[:10])))
+
+        except zipfile.BadZipFile:
+            findings.append(Finding("zip_parse_fail", 15, "File claims to be a ZIP but could not be parsed (corrupt/obfuscated)."))
+
+    # 5) HTML heuristics (treat HTML as a container)
+    is_html = (
+        last_ext in (".html",".htm",".xhtml",".mht",".mhtml")
+        or (magic == "unknown" and b"<html" in data[:5000].lower())
+        or (declared_mime and "text/html" in declared_mime.lower())
+    )
+    if is_html:
+        text_raw = _html_sniff(data)
+        lowered = text_raw.lower()
+
+        # Existing checks (keep)
+        if "<form" in lowered and ("password" in lowered or "passwd" in lowered):
+            findings.append(Finding("html_credential_form", 55,
+                                    "HTML content includes a form that references passwords, consistent with credential harvesting."))
+
+        if "window.location" in lowered or "document.location" in lowered or 'meta http-equiv="refresh"' in lowered:
+            findings.append(Finding("html_redirect", 20,
+                                    "HTML content contains redirect behavior often used to route victims to phishing sites."))
+
+        # New: scripts present at all
+        if "<script" in lowered:
+            findings.append(Finding("html_script", 15,
+                                    "HTML attachment contains script tags (active content)."))
+
+        # New: data URIs (often used to hide payloads)
+        if "data:image/svg+xml" in lowered or "data:text/html" in lowered or "data:application" in lowered:
+            findings.append(Finding("html_data_uri", 15,
+                                    "HTML contains data: URIs, which are often used to embed hidden payloads."))
+
+        # New: extract inline SVG blocks and analyze them
+        svgs = _extract_inline_svgs(text_raw)
+        if svgs:
+            findings.append(Finding("html_inline_svg", 25,
+                                    "HTML contains inline SVG content, which can embed active scripts.",
+                                    evidence=f"count={len(svgs)}"))
+
+            # analyze each SVG; pull worst indicators into top-level findings
+            worst_weight_sum = 0
+            worst_evidence = None
+
+            for svg in svgs[:10]:  # cap to avoid abuse
+                svg_lower = svg.lower()
+                svg_findings = _svg_script_obfuscation_findings(svg_lower)
+                weight_sum = sum(x.weight for x in svg_findings)
+
+                if weight_sum > worst_weight_sum:
+                    worst_weight_sum = weight_sum
+                    # keep evidence short for CLI
+                    worst_evidence = "; ".join(x.code for x in svg_findings[:6])
+
+                # add detailed findings (optional: you can only add worst instead)
+                findings.extend(svg_findings)
+
+            if worst_weight_sum >= 55:
+                findings.append(Finding("html_svg_weaponized", 40,
+                                        "Embedded SVG shows active scripting + obfuscation patterns consistent with malicious loader behavior.",
+                                        evidence=worst_evidence or ""))
+
+    # 6) Script heuristics (very lightweight)
+    if last_ext in (".ps1",".js",".jse",".vbs",".vbe",".wsf",".hta",".cmd",".bat"):
+        text = data[:300_000].decode("utf-8", errors="ignore")
+        lowered = text.lower()
+        if "base64" in lowered or re.search(r"[A-Za-z0-9+/]{300,}={0,2}", text):
+            findings.append(Finding("possible_obfuscation", 35,
+                                    "Script contains long base64-like blobs, a common obfuscation technique."))
+        if "invoke-expression" in lowered or "iex " in lowered:
+            findings.append(Finding("ps_invoke_expression", 40,
+                                    "PowerShell uses Invoke-Expression (IEX), frequently associated with malicious execution."))
+
+    # 7) Entropy signal
+    ent = shannon_entropy(data)
+    if ent > 7.2:
+        findings.append(Finding("high_entropy", 20,
+                                "File content has high entropy, which can indicate packed or encrypted payloads.",
+                                evidence=f"entropy={ent:.2f}"))
+
+    # Score
+    score = sum(f.weight for f in findings)
+    score = max(0, min(100, score))
+    return score, findings
+
 def run_analysis(file_path: str,
                  use_json: bool = False,
                  show_spinners: bool = True):
@@ -764,40 +1082,48 @@ def run_analysis(file_path: str,
     # Load message for later
     message = load_email(file_path)
 
+    attachments = extract_attachments(message)
+
     if ext == '.eml':
         print(BRIGHT_GREEN + "[+] Detected EML file" + RESET)
         print()
 
-        attachments = list_attachments(message)
-        has_any = bool(attachments)
-
-        RISKY_EXT = {
-            ".exe",".msi",".msp",".scr",".com",".bat",".cmd",".ps1",".vbs",".js",".jse",
-            ".lnk",".scf",".url",".pif",
-            ".html",".htm",".xhtml",".mhtml",".mht",".shtml",
-            ".docm",".xlsm",".pptm",
-            ".zip",".rar",".7z",".iso",".img",".cab",".tar",".gz",".bz2",
-            ".hta",".jar",".reg",".dll",".sys",".apk",".dmg"
-        }
-
-        if has_any:
-            print(YELLOW + "[+] Email attachments detected" + RESET)
-            for attachment in attachments:
-                print(YELLOW + f"- {attachment}" + RESET)
-                attach_ext = Path(attachment["filename"]).suffix.lower()
-                suffixes = Path(attachment["filename"]).suffixes
-                if len(suffixes) == 1:
-                    if attach_ext in RISKY_EXT:
-                        print(RED + "Potentially risky filetype detected => " + attach_ext)
-                    else:
-                        print(YELLOW + f"-- {attach_ext}" + RESET)
-                else:
-                    print(RED + f"-- {suffixes} <= Multiple file suffixes detected" + RESET)
-            print()
-
     else:
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
+
+    if len(attachments) > 0:
+            print(YELLOW + "[+] Email attachments detected" + RESET)
+            for attachment in attachments:
+                print("-----------------------------------------------")
+
+                score, findings = analyze_attachment_bytes(
+                    filename=attachment["filename"],
+                    declared_mime=attachment.get("content_type", ""),
+                    data=attachment["payload"],
+                    risky_ext_reasons=RISKY_EXTENSION_REASONS
+                )
+
+                print(f"\nAttachment: {attachment['filename']}")
+                print(f"Declared MIME: {attachment['content_type']}")
+                print(f"Size: {attachment['size']} bytes")
+
+                print()
+                print()
+                print(BRIGHT_BLUE + f"Payload: {attachment['payload']}" + RESET)
+                print()
+                print()
+
+                print(YELLOW + f"Risk Score: {score}/100" + RESET)
+
+                for f in findings:
+                    print(f"  - (+{f.weight}) {f.message}")
+                    if f.evidence:
+                        print(f"      evidence: {f.evidence}")
+                
+                print()
+                print("-----------------------------------------------")
+            print()
 
     # ----------------------------------------------------------
     # Pull Headers from Headers Block
