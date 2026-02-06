@@ -4,7 +4,7 @@
 Core module for processing the email files for analysis
 """
 from __future__ import annotations
-import os
+import os, hashlib
 import re
 import math
 import zipfile
@@ -13,6 +13,8 @@ import json
 import io
 import contextlib
 import mimetypes
+import base64
+import quopri
 
 from email import message_from_string, policy
 from email.policy import default as default_policy
@@ -20,7 +22,7 @@ from email.utils import parseaddr
 from email.message import Message
 from email.parser import BytesParser
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, parse_qs, unquote
 from enum import Enum
 from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
@@ -36,7 +38,7 @@ import dns.resolver
 from phish_analyzer.rdapHelper import lookup_rdap
 
 # Local imports
-from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE
+from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE
 from .pdfReport import generate_pdf_report
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -175,14 +177,18 @@ RISKY_EXTENSION_REASONS = {
     ".dmg": "macOS disk images capable of delivering malicious applications."
 }
 
-# RISKY_EXT = {
-#             ".exe",".msi",".msp",".scr",".com",".bat",".cmd",".ps1",".vbs",".js",".jse",
-#             ".lnk",".scf",".url",".pif",
-#             ".html",".htm",".xhtml",".mhtml",".mht",".shtml",
-#             ".docm",".xlsm",".pptm",
-#             ".zip",".rar",".7z",".iso",".img",".cab",".tar",".gz",".bz2",
-#             ".hta",".jar",".reg",".dll",".sys",".apk",".dmg"
-#         }
+ATTACHMENT_SIGNATURES = {
+    "content_disposition_attachment": b"content-disposition: attachment",
+    "filename_param": b"filename=",
+    "base64_encoding": b"content-transfer-encoding: base64",
+    "binary_content_type": (
+        b"content-type: application/",
+        b"content-type: image/",
+        b"content-type: audio/",
+        b"content-type: video/",
+    ),
+}
+
 
 # optional: known-good company domains (can expand later)
 TRUSTED_BRAND_DOMAINS = {
@@ -216,9 +222,101 @@ def print_banner():
 """
     print(BRIGHT_GREEN + banner + RESET)
 
+def normalize_raw_with_qp(raw: bytes) -> bytes:
+    """
+    Decode quoted-printable once, then normalize line endings + case.
+    Safe for detection purposes.
+    """
+    try:
+        decoded = quopri.decodestring(raw)
+    except Exception:
+        decoded = raw
+
+    return decoded.replace(b"\r\n", b"\n").lower()
+
+def normalize_raw(raw: bytes) -> bytes:
+    return raw.replace(b"\r\n", b"\n").lower()
+
+def raw_attachment_signature_detected(raw: bytes) -> dict:
+    data = normalize_raw_with_qp(raw)
+
+    hits = {
+        "content_disposition_attachment":
+            ATTACHMENT_SIGNATURES["content_disposition_attachment"] in data,
+
+        "filename_param":
+            ATTACHMENT_SIGNATURES["filename_param"] in data,
+
+        "base64_encoding":
+            ATTACHMENT_SIGNATURES["base64_encoding"] in data,
+
+        "binary_content_type":
+            any(sig in data for sig in (
+                b"content-type: application/",
+                b"content-type: image/",
+                b"content-type: audio/",
+                b"content-type: video/",
+            )),
+    }
+
+    return hits
+
+def has_hidden_attachment(raw: bytes) -> bool:
+    hits = raw_attachment_signature_detected(raw)
+
+    score = sum(1 for v in hits.values() if v)
+
+    # Tunable threshold
+    return score >= 3
+
+
 def load_email(path):
     with open(path, "rb") as f:
-        return BytesParser(policy=policy.default).parse(f)
+        raw = f.read()
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    return msg, raw
+
+def load_email_lenient_with_raw(path: str):
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    strict_msg = BytesParser(policy=policy.default).parsebytes(raw)
+    lenient_msg = BytesParser(policy=policy.compat32).parsebytes(raw)
+    return strict_msg, lenient_msg, raw
+
+PDF_BLOCK_RE = re.compile(
+    rb"""
+    Content-Type:\s*application/pdf.*?
+    Content-Transfer-Encoding:\s*base64\s+
+    (?:Content-Disposition:.*?\n)?
+    \n
+    ([A-Za-z0-9+/=\r\n]+)
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE
+)
+
+def salvage_pdf_attachments_from_raw(raw_bytes: bytes):
+    attachments = []
+
+    for match in PDF_BLOCK_RE.finditer(raw_bytes):
+        b64_blob = match.group(1)
+
+        try:
+            pdf_bytes = base64.b64decode(b64_blob, validate=False)
+            if pdf_bytes.startswith(b"%PDF-"):
+                attachments.append({
+                    "filename": "salvaged.pdf",
+                    "content_type": "application/pdf",
+                    "size": len(pdf_bytes),
+                    "payload": pdf_bytes,
+                    "virtual": True,
+                    "virtual_kind": "orphaned_mime_attachment",
+                    "source": "raw-mime-salvage",
+                })
+        except Exception:
+            continue
+
+    return attachments
 
 def add_finding(results_list,
                 category: Category,
@@ -821,26 +919,260 @@ def list_attachments(msg: Message):
             })
     return files
 
+# Very simple URL finder that works well enough for HTML bodies
+URL_RE = re.compile(r"""(?is)\bhttps?://[^\s"'<>]+""")
+
+# Embedded PDF data URI (rare but real)
+DATA_PDF_RE = re.compile(
+    r"""(?is)data:application/pdf\s*;\s*base64\s*,\s*([a-z0-9+/=\s]+)"""
+)
+
+def _get_html_body(msg) -> str:
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            b = part.get_payload(decode=True) or b""
+            return b.decode("utf-8", errors="ignore")
+    return ""
+
+def _looks_like_pdf_url(url: str) -> bool:
+    u = url.lower()
+
+    # Strong signal
+    if u.endswith(".pdf") or ".pdf?" in u or ".pdf#" in u or ".pdf&" in u:
+        return True
+
+    # Common viewer/service hints (Outlook “attachment-like” UI often comes from these)
+    hints = (
+        "application/pdf",
+        "contenttype=application/pdf",
+        "mime=application/pdf",
+        "format=pdf",
+        "type=pdf",
+        "pdfviewer",
+        "view=pdf",
+        "/pdf",
+    )
+    if any(h in u for h in hints):
+        return True
+
+    # Query parameters that often carry filenames
+    try:
+        qs = parse_qs(urlparse(url).query)
+        for _, vals in qs.items():
+            for v in vals:
+                v2 = unquote(v).lower()
+                if v2.endswith(".pdf") or ".pdf" in v2:
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+def _extract_virtual_attachments_from_html(html: str):
+    virtual = []
+
+    # 1) Embedded PDFs (data URI)
+    for b64 in DATA_PDF_RE.findall(html):
+        cleaned = re.sub(r"\s+", "", b64)
+        try:
+            pdf_bytes = base64.b64decode(cleaned, validate=False)
+            if pdf_bytes.startswith(b"%PDF-"):
+                virtual.append({
+                    "filename": "embedded.pdf",
+                    "content_type": "application/pdf",
+                    "size": len(pdf_bytes),
+                    "payload": pdf_bytes,
+                    "virtual": True,
+                    "virtual_kind": "embedded_pdf",
+                    "source": "html:data-uri",
+                })
+        except Exception:
+            continue
+
+    # 2) “PDF-ish” URLs (what Outlook often surfaces like attachments)
+    urls = sorted(set(URL_RE.findall(html)))
+    for url in urls:
+        if _looks_like_pdf_url(url):
+            # we don’t have bytes (unless you choose to fetch it later)
+            virtual.append({
+                "filename": "linked.pdf",          # placeholder name for reporting
+                "content_type": "application/pdf", # how we’re classifying the artifact
+                "size": 0,
+                "payload": None,                   # no bytes
+                "virtual": True,
+                "virtual_kind": "pdf_link",
+                "source": "html:url",
+                "url": url,
+            })
+
+    return virtual
+
 def extract_attachments(msg):
+    """
+    Returns a list of attachment-like objects:
+    - Real MIME attachments always included.
+    - If none are found, also returns “virtual attachments” inferred from HTML.
+    """
     attachments = []
 
-    for part in msg.iter_attachments():
-        filename = part.get_filename()
-        if not filename:
+    # ---- Stage 1: real MIME attachments ----
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
             continue
 
-        payload = part.get_payload(decode=True)
-        if not payload:
+        ctype = part.get_content_type()
+        disp = (part.get_content_disposition() or "").lower()
+        filename = part.get_filename()
+        data = part.get_payload(decode=True)
+
+        if not data:
             continue
+
+        # candidate rules
+        is_candidate = bool(filename) or disp in ("attachment", "inline") or ctype.startswith("application/")
+        if not is_candidate:
+            continue
+
+        if not filename:
+            # infer extension for unnamed parts
+            guessed = { "application/pdf": ".pdf", "text/html": ".html", "text/plain": ".txt" }.get(ctype, "")
+            filename = f"unnamed-part{guessed}"
 
         attachments.append({
             "filename": filename,
-            "content_type": part.get_content_type(),
-            "size": len(payload),
-            "payload": payload  # raw bytes
+            "content_type": ctype,
+            "content_disposition": disp or None,
+            "size": len(data),
+            "payload": data,
+            "virtual": False,
         })
 
+    # ---- Stage 2: fallback “virtual attachments” (Outlook-style) ----
+    if not attachments:
+        html = _get_html_body(msg)
+        # print('Scanning HTML body for virtual attachments...')
+        if html:
+            attachments.extend(_extract_virtual_attachments_from_html(html))
+
     return attachments
+
+def dump_mime_tree(msg: Message):
+    print("Top Content-Type:", msg.get_content_type())
+    print("Is multipart:", msg.is_multipart())
+    print("---- MIME TREE ----")
+
+    count = 0
+    for i, part in enumerate(msg.walk()):
+        ctype = part.get_content_type()
+        maintype = part.get_content_maintype()
+        disp = part.get_content_disposition()  # attachment/inline/None
+        fname = part.get_filename()
+
+        # payload length without decoding (safe)
+        raw_payload = part.get_payload()
+        raw_len = len(raw_payload) if isinstance(raw_payload, (bytes, str)) else None
+
+        # decoded length (best effort)
+        dec = part.get_payload(decode=True)
+        dec_len = len(dec) if isinstance(dec, (bytes, bytearray)) else 0
+
+        print(f"{i:02d}  {ctype:25}  disp={disp!s:10}  fname={fname!s:30}  decoded={dec_len:7}  raw={raw_len}")
+        count += 1
+
+    print("Parts walked:", count)
+
+def dump_mime_tree_plus(raw: bytes):
+    """
+    Dump what the parser sees AND what the raw email contains.
+    Call this with the raw .eml bytes.
+    """
+    # Parse both strict and lenient to compare
+    msg_strict = BytesParser(policy=policy.default).parsebytes(raw)
+    msg_lenient = BytesParser(policy=policy.compat32).parsebytes(raw)
+
+    def _dump(msg: Message, label: str):
+        print(CYAN + f"\n==== PARSED MIME TREE ({label}) ====" + RESET)
+        print("Top Content-Type:", msg.get_content_type())
+        print("Is multipart:", msg.is_multipart())
+        print("---- MIME TREE ----")
+
+        for i, part in enumerate(msg.walk()):
+            ctype = part.get_content_type()
+            disp = part.get_content_disposition()  # attachment/inline/None (strict only)
+            fname = part.get_filename()
+
+            # encoding + id
+            cte = part.get("Content-Transfer-Encoding", "")
+            cid = part.get("Content-ID", "")
+            boundary = ""
+            if part.get_content_maintype() == "multipart":
+                try:
+                    boundary = part.get_boundary() or ""
+                except Exception:
+                    boundary = ""
+
+            dec = part.get_payload(decode=True)
+            dec_len = len(dec) if isinstance(dec, (bytes, bytearray)) else 0
+
+            print(
+                f"{i:02d}  {ctype:30} "
+                f"disp={str(disp):10} "
+                f"cte={str(cte):8} "
+                f"fname={str(fname)[:40]:40} "
+                f"cid={str(cid)[:28]:28} "
+                f"decoded={dec_len:7} "
+                f"boundary={boundary}"
+            )
+
+    _dump(msg_strict, "policy.default")
+    _dump(msg_lenient, "policy.compat32")
+
+    # ---- RAW SCAN ----
+    print(CYAN + "\n==== RAW SCAN (parser-independent) ====" + RESET)
+    raw_l = raw.replace(b"\r\n", b"\n").lower()
+
+    # Count common attachment headers by type
+    ct_hits = re.findall(rb"\ncontent-type:\s*([^\n;]+)", raw_l)
+    disp_hits = re.findall(rb"\ncontent-disposition:\s*([^\n;]+)", raw_l)
+    cte_hits = re.findall(rb"\ncontent-transfer-encoding:\s*([^\n]+)", raw_l)
+
+    print("Raw 'Content-Type:' lines found:", len(ct_hits))
+    print("Raw 'Content-Disposition:' lines found:", len(disp_hits))
+    print("Raw 'Content-Transfer-Encoding:' lines found:", len(cte_hits))
+
+    # Show a small histogram of the most common content-types
+    from collections import Counter
+    ct_counter = Counter([c.strip() for c in ct_hits])
+    for c, n in ct_counter.most_common(10):
+        print(f"  CT {c.decode('utf-8', 'ignore')[:60]} => {n}")
+
+    # Specifically look for "application/pdf" and filenames
+    # pdf_ct = b"content-type: application/pdf" in raw_l
+    # pdf_fname = re.search(rb'filename\*?=(?:"([^"]+)"|([^;\n]+))', raw_l)
+    # print("Contains 'Content-Type: application/pdf' in raw:", pdf_ct)
+    # if pdf_fname:
+        # fn = (pdf_fname.group(1) or pdf_fname.group(2) or b"").strip()
+        # print("First filename= found (raw):", fn.decode("utf-8", "ignore")[:120])
+
+    # Boundary sanity: extract declared boundary from top headers
+    # (works even if later parts are malformed)
+    m = re.search(rb'content-type:\s*multipart/[^\n;]+;\s*boundary="?([^"\n;]+)"?', raw_l)
+    if m:
+        boundary = m.group(1)
+        bline = b"\n--" + boundary
+        count_boundary = raw_l.count(bline)
+        print("Top boundary (raw):", boundary.decode("utf-8", "ignore"))
+        print("Occurrences of top boundary delimiter in raw:", count_boundary)
+    else:
+        print("Top boundary not found in raw headers (or folded/odd formatting).")
+
+    # Show context around application/pdf if present
+    idx = raw_l.find(b"content-type: application/pdf")
+    if idx != -1:
+        start = max(0, idx - 300)
+        end = min(len(raw), idx + 600)
+        print("\n--- RAW CONTEXT around application/pdf ---")
+        print(raw[start:end].decode("utf-8", errors="ignore"))
 
 def analyze_attachment(att, content_bytes=None):
     path = Path(att["filename"])
@@ -928,6 +1260,112 @@ def _svg_script_obfuscation_findings(svg_text_lower: str) -> List[Finding]:
 
     return f
 
+def analyze_pdf_bytes(data: bytes) -> list[Finding]:
+    findings: list[Finding] = []
+    
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        findings.append(Finding(
+            "pdf_parser_missing", 0,
+            "PDF deep inspection not available because 'pypdf' is not installed."
+        ))
+        return findings
+
+    # Quick raw scan (cheap, catches many malicious PDFs even if parsing fails)
+    raw_head = data[:500_000].lower()
+    if b"/javascript" in raw_head or b"/js" in raw_head:
+        findings.append(Finding("pdf_javascript_raw", 40,
+                                "PDF contains JavaScript markers (raw scan), which may execute on open."))
+
+    if b"/openaction" in raw_head or b"/aa" in raw_head:
+        findings.append(Finding("pdf_auto_action_raw", 45,
+                                "PDF contains auto-action markers (OpenAction/AA) that can trigger behavior on open."))
+
+    # Deep parse
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+    except Exception as e:
+        findings.append(Finding("pdf_parse_fail", 20,
+                                "PDF could not be fully parsed (corrupt/obfuscated), which is suspicious for email attachments.",
+                                evidence=str(e)[:200]))
+        return findings
+
+    if getattr(reader, "is_encrypted", False):
+        findings.append(Finding("pdf_encrypted", 20,
+                                "PDF is encrypted, which can prevent scanning and is sometimes used to hide malicious content."))
+
+    # Safely access catalog/root
+    try:
+        root = reader.trailer.get("/Root")
+    except Exception:
+        root = None
+
+    def walk_obj(obj, depth=0):
+        # Very conservative recursion guard
+        if depth > 20:
+            return
+        try:
+            # pypdf objects often behave like dicts
+            if hasattr(obj, "keys"):
+                for k in obj.keys():
+                    key = str(k)
+                    val = obj.get(k)
+
+                    lowk = key.lower()
+                    if lowk in ("/openaction", "/aa"):
+                        findings.append(Finding("pdf_auto_action", 50,
+                                                f"PDF defines {key}, which can trigger actions automatically."))
+                    if lowk in ("/javascript", "/js"):
+                        findings.append(Finding("pdf_javascript", 55,
+                                                f"PDF contains {key} actions/scripts."))
+
+                    if lowk == "/launch":
+                        findings.append(Finding("pdf_launch", 70,
+                                                "PDF contains a Launch action, which can attempt to run external programs."))
+
+                    if lowk == "/uri":
+                        # Extract URL-ish evidence if possible
+                        ev = None
+                        try:
+                            ev = str(val)[:200]
+                        except Exception:
+                            pass
+                        findings.append(Finding("pdf_external_uri", 25,
+                                                "PDF contains external URI actions/links (can be used for phishing redirects).",
+                                                evidence=ev))
+
+                    if lowk in ("/embeddedfile", "/filespec"):
+                        findings.append(Finding("pdf_embedded_file", 70,
+                                                "PDF references embedded files (EmbeddedFile/Filespec), a common malware delivery method."))
+
+                    if lowk == "/acroform":
+                        findings.append(Finding("pdf_forms", 25,
+                                                "PDF contains an AcroForm (interactive form), which is sometimes used for phishing."))
+
+                    # Recurse
+                    walk_obj(val, depth + 1)
+
+            # Handle arrays/lists
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk_obj(item, depth + 1)
+        except Exception:
+            return
+
+    if root is not None:
+        walk_obj(root, 0)
+
+    # Simple URL extraction from raw bytes (helps analysts)
+    urls = set(re.findall(rb"https?://[^\s<>\"]{6,200}", data[:1_000_000]))
+    if urls:
+        sample = b", ".join(sorted(list(urls))[:5]).decode("utf-8", "ignore")
+        findings.append(Finding("pdf_urls_found", 10,
+                                "Extracted URLs from PDF content (review for phishing destinations).",
+                                evidence=sample))
+
+    return findings
+
 def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
                              risky_ext_reasons: Dict[str, str]) -> Tuple[int, List[Finding]]:
     findings: List[Finding] = []
@@ -955,6 +1393,9 @@ def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
     # 2) Magic / type sniff
     magic = detect_magic(data)
     findings.append(Finding("magic_type", 0, f"Detected file signature: {magic}"))
+
+    if magic == "pdf":
+        findings.extend(analyze_pdf_bytes(data))
 
     # 3) MIME mismatch (best-effort)
     # declared_mime might be wrong; still useful as a signal
@@ -1068,6 +1509,301 @@ def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
     score = max(0, min(100, score))
     return score, findings
 
+def diagnose_eml(eml_file_path):
+    """
+    Examine the .eml file in multiple ways to understand its structure
+    """
+    print("="*70)
+    print("EML FILE DIAGNOSTICS")
+    print("="*70)
+    print(f"File: {eml_file_path}\n")
+    
+    # Read as raw bytes
+    with open(eml_file_path, 'rb') as f:
+        raw_bytes = f.read()
+    
+    print(f"File size: {len(raw_bytes)} bytes\n")
+    
+    # Try different decodings
+    decodings = []
+    
+    # UTF-8
+    try:
+        utf8_content = raw_bytes.decode('utf-8')
+        decodings.append(('UTF-8', utf8_content))
+        print("✓ UTF-8 decoding successful")
+    except UnicodeDecodeError as e:
+        print(f"✗ UTF-8 decoding failed: {e}")
+    
+    # Latin-1 (always works)
+    latin1_content = raw_bytes.decode('latin-1')
+    decodings.append(('Latin-1', latin1_content))
+    print("✓ Latin-1 decoding successful")
+    
+    # ASCII with errors ignored
+    ascii_content = raw_bytes.decode('ascii', errors='ignore')
+    decodings.append(('ASCII (ignore)', ascii_content))
+    print("✓ ASCII decoding successful\n")
+    
+    print("="*70)
+    print("BOUNDARY ANALYSIS")
+    print("="*70)
+    
+    for encoding_name, content in decodings:
+        print(f"\n{encoding_name} encoding:")
+        print("-" * 40)
+        
+        # Find all boundary-like strings
+        boundaries = re.findall(r'--[=\w]+==--', content)
+        if boundaries:
+            print(f"  Closing boundaries found: {len(set(boundaries))}")
+            for b in set(boundaries):
+                count = content.count(b)
+                print(f"    {b} (appears {count} time(s))")
+        else:
+            print("  No closing boundaries found")
+        
+        # Find boundary declarations
+        boundary_decls = re.findall(r'boundary="?([^"\s]+)"?', content, re.IGNORECASE)
+        if boundary_decls:
+            print(f"\n  Boundary declarations: {len(set(boundary_decls))}")
+            for b in set(boundary_decls):
+                print(f"    {b}")
+    
+    print("\n" + "="*70)
+    print("PDF CONTENT ANALYSIS")
+    print("="*70)
+    
+    for encoding_name, content in decodings:
+        print(f"\n{encoding_name} encoding:")
+        print("-" * 40)
+        
+        # Look for PDF markers
+        pdf_content_type = content.count('application/pdf')
+        pdf_header = raw_bytes.count(b'%PDF')
+        
+        print(f"  'application/pdf' appears: {pdf_content_type} time(s)")
+        print(f"  '%PDF' appears in raw bytes: {pdf_header} time(s)")
+        
+        # Find where PDF content is
+        pdf_idx = content.find('application/pdf')
+        if pdf_idx >= 0:
+            # Show context around the PDF declaration
+            start = max(0, pdf_idx - 200)
+            end = min(len(content), pdf_idx + 400)
+            snippet = content[start:end]
+            
+            print(f"\n  Context around 'application/pdf' (position {pdf_idx}):")
+            print("  " + "─" * 66)
+            for line in snippet.split('\n'):
+                print(f"  {line[:66]}")
+            print("  " + "─" * 66)
+    
+    print("\n" + "="*70)
+    print("SEARCHING FOR PDF DATA AFTER LAST CLOSING BOUNDARY")
+    print("="*70)
+    
+    # Use Latin-1 as it's most reliable
+    content = latin1_content
+    
+    # Find all closing boundaries
+    closing_boundaries = list(re.finditer(r'--[=\w]+==--', content))
+    
+    if closing_boundaries:
+        last_boundary = closing_boundaries[-1]
+        print(f"\nLast closing boundary: {last_boundary.group()}")
+        print(f"Position: {last_boundary.start()} - {last_boundary.end()}")
+        
+        after_boundary = content[last_boundary.end():]
+        print(f"\nContent after last boundary: {len(after_boundary)} characters")
+        
+        # Check if there's PDF content after it
+        if 'application/pdf' in after_boundary:
+            print("✓ Found 'application/pdf' after the last closing boundary!")
+            
+            pdf_idx = after_boundary.find('application/pdf')
+            snippet_start = max(0, pdf_idx - 50)
+            snippet_end = min(len(after_boundary), pdf_idx + 300)
+            
+            print("\nSnippet:")
+            print("─" * 70)
+            print(after_boundary[snippet_start:snippet_end])
+            print("─" * 70)
+        else:
+            print("✗ No 'application/pdf' found after last closing boundary")
+    else:
+        print("\n✗ No closing boundaries found in file")
+    
+    print("\n" + "="*70)
+    print("RAW BYTE SEARCH FOR PDF")
+    print("="*70)
+    
+    # Search for %PDF in raw bytes
+    pdf_magic = b'%PDF'
+    pdf_positions = []
+    pos = 0
+    while True:
+        pos = raw_bytes.find(pdf_magic, pos)
+        if pos == -1:
+            break
+        pdf_positions.append(pos)
+        pos += 1
+    
+    if pdf_positions:
+        print(f"\n✓ Found {len(pdf_positions)} PDF header(s) at byte position(s):")
+        for pos in pdf_positions:
+            print(f"  Position {pos}: {raw_bytes[pos:pos+20]}")
+    else:
+        print("\n✗ No PDF headers found in raw bytes")
+
+def sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def audit_eml_bytes(eml_path: str, parser_input_bytes: bytes | None = None) -> dict:
+    p = Path(eml_path)
+    disk_size = p.stat().st_size
+    disk_bytes = p.read_bytes()
+
+    report = {
+        "disk_size": disk_size,
+        "read_size": len(disk_bytes),
+        "disk_sha256": sha256(disk_bytes),
+        "read_sha256": sha256(disk_bytes),  # same, but explicit
+        "parser_input_size": len(parser_input_bytes) if parser_input_bytes is not None else None,
+        "parser_input_sha256": sha256(parser_input_bytes) if parser_input_bytes is not None else None,
+        "mismatch_disk_vs_read": disk_size != len(disk_bytes),
+        "mismatch_read_vs_parser_input": (parser_input_bytes is not None and len(disk_bytes) != len(parser_input_bytes)),
+        "contains_pdf_marker": (b"Content-Type: application/pdf" in disk_bytes) or (b"JVBERi0" in disk_bytes),
+        "contains_nul_byte": (b"\x00" in disk_bytes),
+        "first_nul_index": disk_bytes.find(b"\x00"),
+    }
+    return report
+
+def detect_bad_epilogue(file_path):
+    """
+    Detect BadEpilogue attack - content hidden after MIME closing boundaries
+    """
+    print("="*70)
+    print("BadEpilogue Attack Detector")
+    print("="*70)
+    print(f"Analyzing: {file_path}\n")
+    
+    # Read the raw file
+    with open(file_path, 'rb') as f:
+        raw_bytes = f.read()
+    
+    # Try to decode
+    try:
+        content = raw_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        content = raw_bytes.decode('latin-1', errors='ignore')
+    
+    print(f"File size: {len(raw_bytes):,} bytes\n")
+    
+    # Find all MIME boundaries (both opening and closing)
+    # Closing boundaries end with --
+    # Matches both formats: --boundary-- and --====boundary====--
+    closing_boundaries = list(re.finditer(r'--([\w=]+)--', content))
+    
+    if not closing_boundaries:
+        print("⚠ No MIME closing boundaries found")
+        print("  This might not be a MIME email or boundaries use different format\n")
+        return False
+    
+    print(f"Found {len(closing_boundaries)} closing MIME boundary/boundaries:\n")
+    
+    for i, match in enumerate(closing_boundaries, 1):
+        boundary_str = match.group(0)
+        position = match.end()
+        
+        print(f"  [{i}] {boundary_str}")
+        print(f"      Position: {position:,} / {len(content):,} bytes")
+        
+        # Check what's after this boundary
+        remaining = content[position:]
+        remaining_stripped = remaining.strip()
+        
+        if remaining_stripped:
+            print(f"      ⚠ WARNING: {len(remaining_stripped):,} bytes of content after this boundary!")
+            
+            # Check if it looks like another MIME part
+            if 'Content-Type:' in remaining[:500]:
+                print(f"      🚨 SUSPICIOUS: Contains 'Content-Type:' header!")
+            
+            if 'application/pdf' in remaining[:500].lower():
+                print(f"      🚨 ALERT: Contains 'application/pdf' - likely BadEpilogue attack!")
+            
+            if 'base64' in remaining[:500].lower():
+                print(f"      🚨 ALERT: Contains 'base64' encoding!")
+            
+            # Show a preview
+            preview = remaining_stripped[:200].replace('\n', ' ')
+            print(f"      Preview: {preview}...")
+        else:
+            print(f"      ✓ Clean - no content after boundary")
+        
+        print()
+    
+    # Find the LAST closing boundary
+    if closing_boundaries:
+        last_boundary = closing_boundaries[-1]
+        epilogue_start = last_boundary.end()
+        epilogue = content[epilogue_start:].strip()
+        
+        print("="*70)
+        print("EPILOGUE ANALYSIS (content after last MIME boundary)")
+        print("="*70)
+        
+        if epilogue:
+            print(f"⚠ EPILOGUE DETECTED: {len(epilogue):,} bytes\n")
+            
+            # Analyze what's in the epilogue
+            has_content_type = bool(re.search(r'Content-Type:', epilogue, re.IGNORECASE))
+            has_pdf = bool(re.search(r'application/pdf', epilogue, re.IGNORECASE))
+            has_base64 = bool(re.search(r'base64', epilogue, re.IGNORECASE))
+            has_boundary = bool(re.search(r'--[=\w]+==[^-]', epilogue))
+            
+            threat_level = 0
+            
+            if has_content_type:
+                print("🚨 Contains Content-Type header")
+                threat_level += 2
+            
+            if has_pdf:
+                print("🚨 Contains PDF content type")
+                threat_level += 3
+            
+            if has_base64:
+                print("🚨 Contains base64 encoding")
+                threat_level += 2
+            
+            if has_boundary:
+                print("🚨 Contains additional MIME boundaries")
+                threat_level += 3
+            
+            print()
+            
+            if threat_level >= 5:
+                print("🔴 THREAT LEVEL: HIGH - Likely BadEpilogue Attack!")
+                print("    This email contains hidden content after the MIME structure.")
+                print("    This is commonly used to bypass email security scanners.\n")
+            elif threat_level >= 2:
+                print("🟡 THREAT LEVEL: MEDIUM - Suspicious epilogue content")
+            else:
+                print("🟢 THREAT LEVEL: LOW - Epilogue may be benign")
+            
+            print("\nEpilogue Preview (first 500 chars):")
+            print("-" * 70)
+            print(epilogue[:500])
+            print("-" * 70)
+            
+            return threat_level >= 5
+        else:
+            print("✓ No epilogue - email ends cleanly after last MIME boundary\n")
+            return False
+    
+    return False
+
 def run_analysis(file_path: str,
                  use_json: bool = False,
                  show_spinners: bool = True):
@@ -1076,13 +1812,11 @@ def run_analysis(file_path: str,
 
     analysis_results = []
 
+    # Load message for later
+    message, raw = load_email(file_path)
+
     # Get file extension
     ext = get_file_extension(file_path)
-
-    # Load message for later
-    message = load_email(file_path)
-
-    attachments = extract_attachments(message)
 
     if ext == '.eml':
         print(BRIGHT_GREEN + "[+] Detected EML file" + RESET)
@@ -1092,10 +1826,45 @@ def run_analysis(file_path: str,
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
         print()
 
+    print(YELLOW + "[*] Analyzing MIME Data" + RESET)
+
+    dump_mime_tree_plus(raw)
+    print()
+
+    # Extract attachments from the email file
+    print(YELLOW + '[*] Attachment scanning...' + RESET)
+    attachments = extract_attachments(message)
+
+    if len(attachments) == 0:
+        print(YELLOW + '[*] None found. Advanced attachment scanning...' + RESET)
+        salvaged = salvage_pdf_attachments_from_raw(raw)
+        attachments.extend(salvaged)
+
+        sig_hits = raw_attachment_signature_detected(raw)
+
+        if sum(1 for v in sig_hits.values() if v) >= 3:
+            print('Found raw attachment')
+            # findings.append(
+            #     Finding(
+            #         code="raw_attachment_signature_detected",
+            #         weight=35,
+            #         message=(
+            #             "Attachment-like MIME signatures detected in raw email "
+            #             "that are not represented in the parsed MIME tree."
+            #         ),
+            #         evidence=", ".join(k for k, v in sig_hits.items() if v),
+            #     )
+            # )
+        else:
+            print(BRIGHT_RED + '[*] Could not find any attachments' + RESET)
+
     if len(attachments) > 0:
-            print(YELLOW + "[+] Email attachments detected" + RESET)
+            print(BRIGHT_GREEN + "[+] Email attachments detected" + RESET)
+            if show_spinners:
+                analyzeSpinner = Halo(text="Analyzing attachments...", spinner="dots")
+                analyzeSpinner.start()
             for attachment in attachments:
-                print("-----------------------------------------------")
+                print(BRIGHT_WHITE + "-----------------------------------------------" + RESET)
 
                 score, findings = analyze_attachment_bytes(
                     filename=attachment["filename"],
@@ -1110,20 +1879,31 @@ def run_analysis(file_path: str,
 
                 print()
                 print()
-                print(BRIGHT_BLUE + f"Payload: {attachment['payload']}" + RESET)
+                print(BRIGHT_BLUE + f"Payload (1000 chars): {attachment['payload'][:1000]}" + RESET)
                 print()
                 print()
-
-                print(YELLOW + f"Risk Score: {score}/100" + RESET)
 
                 for f in findings:
                     print(f"  - (+{f.weight}) {f.message}")
                     if f.evidence:
                         print(f"      evidence: {f.evidence}")
+
+                print()
+                print(YELLOW + f"Risk Score: {score}/100" + RESET)
                 
                 print()
-                print("-----------------------------------------------")
+                print(BRIGHT_WHITE + "-----------------------------------------------" + RESET)
+            
+            if show_spinners:
+                analyzeSpinner.stop()
+
             print()
+    else:
+        is_attack = detect_bad_epilogue(file_path)
+        if is_attack:
+            print('BadEpilogue Detected')
+        else:
+            print('BadEpilogue Not Detected')
 
     # ----------------------------------------------------------
     # Pull Headers from Headers Block
@@ -1166,10 +1946,10 @@ def run_analysis(file_path: str,
     url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
 
     if plain_body:
-        print(YELLOW + "\n=== Plain text body (first 400 chars) ===" + RESET)
+        print(CYAN + "\n=== Plain text body (first 400 chars) ===" + RESET)
         print(plain_body[:400])
     elif html_body:
-        print(YELLOW + "\n=== HTML body (first 400 chars) ===" + RESET)
+        print(CYAN + "\n=== HTML body (first 400 chars) ===" + RESET)
         print(html_body[:400])
     else:
         print(RED + "\n[!] No body content found in this message." + RESET)
