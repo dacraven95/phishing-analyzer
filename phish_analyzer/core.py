@@ -25,7 +25,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse, parse_qs, unquote
 from enum import Enum
 from datetime import datetime
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple, Union
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +38,35 @@ import dns.resolver
 from phish_analyzer.rdapHelper import lookup_rdap
 
 # Local imports
-from .colors import RED, GREEN, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE
+from .colors import RED, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE, BRIGHT_YELLOW
 from .pdfReport import generate_pdf_report
 
 BASE_DIR = Path(__file__).resolve().parent
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+# Parsing header blocks / full EML repeatedly is expensive. These helpers cache the
+# parsed Message object keyed by file path + mtime.
+_PARSED_MSG_CACHE: dict[str, tuple[float, Message]] = {}
+
+
+def _get_cached_parsed_message(file_path: str) -> Message:
+    """Parse the email/headers file once per mtime and reuse the Message."""
+    try:
+        mtime = Path(file_path).stat().st_mtime
+    except Exception:
+        # Fall back to uncached parse if we can't stat the file.
+        ext = get_file_extension(file_path)
+        return parse_detected_filetype(ext, file_path)
+
+    cached = _PARSED_MSG_CACHE.get(file_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    ext = get_file_extension(file_path)
+    msg = parse_detected_filetype(ext, file_path)
+    _PARSED_MSG_CACHE[file_path] = (mtime, msg)
+    return msg
+
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -232,42 +257,44 @@ def normalize_raw_with_qp(raw: bytes) -> bytes:
     except Exception:
         decoded = raw
 
+    # Normalize all common line endings: CRLF and CR -> LF
+    decoded = decoded.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
     return decoded.replace(b"\r\n", b"\n").lower()
 
 def normalize_raw(raw: bytes) -> bytes:
-    return raw.replace(b"\r\n", b"\n").lower()
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").lower()
 
 def raw_attachment_signature_detected(raw: bytes) -> dict:
     data = normalize_raw_with_qp(raw)
+    sigs = ATTACHMENT_SIGNATURES
 
-    hits = {
+    binary_type_prefixes = (
+        b"content-type: application/",
+        b"content-type: image/",
+        b"content-type: audio/",
+        b"content-type: video/",
+    )
+
+    return {
         "content_disposition_attachment":
-            ATTACHMENT_SIGNATURES["content_disposition_attachment"] in data,
+            sigs["content_disposition_attachment"] in data,
 
         "filename_param":
-            ATTACHMENT_SIGNATURES["filename_param"] in data,
+            sigs["filename_param"] in data,
 
         "base64_encoding":
-            ATTACHMENT_SIGNATURES["base64_encoding"] in data,
+            sigs["base64_encoding"] in data,
 
         "binary_content_type":
-            any(sig in data for sig in (
-                b"content-type: application/",
-                b"content-type: image/",
-                b"content-type: audio/",
-                b"content-type: video/",
-            )),
+            any(prefix in data for prefix in binary_type_prefixes),
     }
-
-    return hits
 
 def has_hidden_attachment(raw: bytes) -> bool:
     hits = raw_attachment_signature_detected(raw)
 
-    score = sum(1 for v in hits.values() if v)
-
     # Tunable threshold
-    return score >= 3
+    return sum(hits.values()) >= 3
 
 
 def load_email(path):
@@ -351,19 +378,21 @@ def extract_header_block(raw: str) -> str:
     Extracts the header block from text, even if there is extra text before/after.
     Headers end at the first blank line.
     """
-    lines = raw.splitlines()
-    # Find the first "start" of a header: a line containing "Something:"
-    # and then gather everything until the first blank line.
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
     header_started = False
     header_lines = []
 
     for line in lines:
         if not header_started:
-            if ":" in line and "#" not in line:
-                header_started = True
-                header_lines.append(line)
+            # Heuristic: looks like "Header-Name: value"
+            if ":" in line:
+                name, _, _ = line.partition(":")
+                if name and name.strip() == name and " " not in name:
+                    header_started = True
+                    header_lines.append(line)
         else:
-            if line.strip() == "":    # blank line = end of headers
+            if not line.strip():  # blank line = end of headers
                 break
             header_lines.append(line)
 
@@ -812,17 +841,43 @@ def get_file_extension(file):
     _, ext = os.path.splitext(file)
     return ext.lower()
 
-def parse_detected_filetype(ext, filename):
-    if ext == ".eml":
-        # Handle EML file
-        return parse_full_eml(filename)
-    else:
-        # Handle as TXT file
-        return parse_headers_from_file(filename)
+# (path, mtime_ns, ext) -> parsed message object
+_PARSED_MSG_CACHE: Dict[Tuple[str, int, str], Any] = {}
+
+def parse_detected_filetype(ext: str, file_path: Union[str, Path]):
+    ext = (ext or "").lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+
+    file_path = str(file_path)
+
+    try:
+        mtime_ns = os.stat(file_path).st_mtime_ns
+    except OSError:
+        # If we can't stat it, just parse normally (no caching).
+        return parse_full_eml(file_path) if ext == ".eml" else parse_headers_from_file(file_path)
+
+    key = (file_path, mtime_ns, ext)
+    cached = _PARSED_MSG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    parsed = parse_full_eml(file_path) if ext == ".eml" else parse_headers_from_file(file_path)
+    _PARSED_MSG_CACHE[key] = parsed
+    return parsed
 
 def get_email_body(file_path):
-    # Get file extension
-    ext = get_file_extension(file_path)
+    # Parse once (cached) and then extract bodies
+    msg = _get_cached_parsed_message(file_path)
+    plain_body, html_body = extract_bodies(msg)
+
+    email_body = None
+    if plain_body:
+        email_body = plain_body or None
+    if html_body:
+        email_body = html_body or None
+
+    return email_body
 
     # Check for file type .eml, .txt and parse message
     msg = parse_detected_filetype(ext, file_path)
@@ -845,7 +900,9 @@ def get_headers(file_path, header: str = None):
         return
     
     # Get file extension
-    ext = get_file_extension(file_path)
+    msg = _get_cached_parsed_message(file_path)
+    selected_hdr = msg.get_all(header) or []
+    return selected_hdr
 
     headers = parse_detected_filetype(ext, file_path)
     selected_hdr = headers.get_all(header) or []
@@ -859,7 +916,8 @@ def get_header(file_path, header: str = None):
         return
     
     # Get file extension
-    ext = get_file_extension(file_path)
+    msg = _get_cached_parsed_message(file_path)
+    return msg[header] or None
 
     headers = parse_detected_filetype(ext, file_path)
     selected_hdr = headers[header] or None
@@ -918,9 +976,6 @@ def list_attachments(msg: Message):
                 "size": len(part.get_payload(decode=True) or b""),
             })
     return files
-
-# Very simple URL finder that works well enough for HTML bodies
-URL_RE = re.compile(r"""(?is)\bhttps?://[^\s"'<>]+""")
 
 # Embedded PDF data URI (rare but real)
 DATA_PDF_RE = re.compile(
@@ -990,7 +1045,7 @@ def _extract_virtual_attachments_from_html(html: str):
             continue
 
     # 2) “PDF-ish” URLs (what Outlook often surfaces like attachments)
-    urls = sorted(set(URL_RE.findall(html)))
+    urls = sorted(set(URL_REGEX.findall(html)))
     for url in urls:
         if _looks_like_pdf_url(url):
             # we don’t have bytes (unless you choose to fetch it later)
@@ -1809,7 +1864,6 @@ def run_analysis(file_path: str,
                  show_spinners: bool = True):
 
     print_banner()
-
     analysis_results = []
 
     # Load message for later
@@ -1820,14 +1874,13 @@ def run_analysis(file_path: str,
 
     if ext == '.eml':
         print(BRIGHT_GREEN + "[+] Detected EML file" + RESET)
-        print()
 
     else:
         print(YELLOW + "[*] Treating file as raw headers" + RESET)
-        print()
+    print()
 
+    # --- MIME tree
     print(YELLOW + "[*] Analyzing MIME Data" + RESET)
-
     dump_mime_tree_plus(raw)
     print()
 
@@ -1835,8 +1888,8 @@ def run_analysis(file_path: str,
     print(YELLOW + '[*] Attachment scanning...' + RESET)
     attachments = extract_attachments(message)
 
-    if len(attachments) == 0:
-        print(YELLOW + '[*] None found. Advanced attachment scanning...' + RESET)
+    if not attachments:
+        print(YELLOW + '[*] No attachments found. Trying Advanced attachment scanning...' + RESET)
         salvaged = salvage_pdf_attachments_from_raw(raw)
         attachments.extend(salvaged)
 
@@ -1844,27 +1897,17 @@ def run_analysis(file_path: str,
 
         if sum(1 for v in sig_hits.values() if v) >= 3:
             print('Found raw attachment')
-            # findings.append(
-            #     Finding(
-            #         code="raw_attachment_signature_detected",
-            #         weight=35,
-            #         message=(
-            #             "Attachment-like MIME signatures detected in raw email "
-            #             "that are not represented in the parsed MIME tree."
-            #         ),
-            #         evidence=", ".join(k for k, v in sig_hits.items() if v),
-            #     )
-            # )
         else:
-            print(BRIGHT_RED + '[*] Could not find any attachments' + RESET)
+            print(YELLOW + '[*] Could not find any attachments' + RESET)
 
-    if len(attachments) > 0:
+    if attachments:
             print(BRIGHT_GREEN + "[+] Email attachments detected" + RESET)
-            if show_spinners:
-                analyzeSpinner = Halo(text="Analyzing attachments...", spinner="dots")
-                analyzeSpinner.start()
             for attachment in attachments:
                 print(BRIGHT_WHITE + "-----------------------------------------------" + RESET)
+
+                if show_spinners:
+                    analyzeSpinner = Halo(text="Analyzing attachment...", spinner="dots")
+                    analyzeSpinner.start()
 
                 score, findings = analyze_attachment_bytes(
                     filename=attachment["filename"],
@@ -1873,32 +1916,35 @@ def run_analysis(file_path: str,
                     risky_ext_reasons=RISKY_EXTENSION_REASONS
                 )
 
+                if show_spinners:
+                    analyzeSpinner.stop()
+
                 print(f"\nAttachment: {attachment['filename']}")
                 print(f"Declared MIME: {attachment['content_type']}")
                 print(f"Size: {attachment['size']} bytes")
 
                 print()
                 print()
-                print(BRIGHT_BLUE + f"Payload (1000 chars): {attachment['payload'][:1000]}" + RESET)
+                payload_preview = attachment["payload"][:1000]
+                print(BRIGHT_BLUE + f"Payload (1000 chars): {payload_preview}" + RESET)
                 print()
                 print()
 
-                for f in findings:
+                print(BRIGHT_YELLOW + f"Total Findings: {len(findings)}" + RESET)
+                for f in findings[:10]:
                     print(f"  - (+{f.weight}) {f.message}")
                     if f.evidence:
                         print(f"      evidence: {f.evidence}")
-
+                print(BRIGHT_YELLOW + f"{len(findings) - 10} additional findings omitted from output" + RESET)
                 print()
                 print(YELLOW + f"Risk Score: {score}/100" + RESET)
-                
                 print()
                 print(BRIGHT_WHITE + "-----------------------------------------------" + RESET)
-            
-            if show_spinners:
-                analyzeSpinner.stop()
 
             print()
     else:
+        print(YELLOW + "[*] Running BadEpilogue Attack Detector")
+        print()
         is_attack = detect_bad_epilogue(file_path)
         if is_attack:
             print('BadEpilogue Detected')
@@ -1915,17 +1961,17 @@ def run_analysis(file_path: str,
     from_hdr = get_header(file_path, "From")
     to_hdr = get_header(file_path, "To")
     reply_to_hdr = get_header(file_path, "Reply-To")
-    return_path_hdr = get_header("Return-Path")
-    date_hdr = get_header("Date")
-    subject_hdr = get_header("Subject")
-    mime_version_hdr = get_header("MIME-Version")
-    content_language_hdr = get_header("Content-Language")
-    content_type_hdr = get_header("Content-Type")
-    content_transfer_encode_hdr = get_header("Content-Transfer-Encoding")
-    thread_topic_hdr = get_header("Thread-Topic")
-    org_authAs_hdr = get_header("X-MS-Exchange-Organization-AuthAs")
-    has_attachment_hdr = get_header("X-MS-Has-Attach")
-    origin_IP_hdr = get_header("X-Originating-IP")
+    return_path_hdr = get_header(file_path, "Return-Path")
+    date_hdr = get_header(file_path, "Date")
+    subject_hdr = get_header(file_path, "Subject")
+    mime_version_hdr = get_header(file_path, "MIME-Version")
+    content_language_hdr = get_header(file_path, "Content-Language")
+    content_type_hdr = get_header(file_path, "Content-Type")
+    content_transfer_encode_hdr = get_header(file_path, "Content-Transfer-Encoding")
+    thread_topic_hdr = get_header(file_path, "Thread-Topic")
+    org_authAs_hdr = get_header(file_path, "X-MS-Exchange-Organization-AuthAs")
+    has_attachment_hdr = get_header(file_path, "X-MS-Has-Attach")
+    origin_IP_hdr = get_header(file_path, "X-Originating-IP")
 
     auth_results_headers = get_headers(file_path,"authentication-results")
     has_auth_headers = bool(auth_results_headers)
@@ -2283,11 +2329,13 @@ def run_analysis_capture_text(file_path: str,
     with contextlib.redirect_stdout(buffer):
         run_analysis(file_path, use_json=use_json, show_spinners=False)
 
-    ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
-
     # Get everything that was printed
     output = buffer.getvalue()
-    return ANSI_RE.sub("", output) if strip_ansi else output
+    
+    if strip_ansi and "\x1b" in output:
+        output = ANSI_RE.sub("", output)
+
+    return output
 
 def analyze_sender_rdap(domain: str, analysis_results):
     rdap = lookup_rdap(domain)
