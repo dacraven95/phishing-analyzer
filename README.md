@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.4.9
+# 🛡️ Phishing Analyzer v0.4.9a
 ### A lightweight command-line tool for analyzing email headers, email attachments, and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect emails' attachments and headers for suspicious patterns such as SPF failures, domain mismatches, suspicious filetypes, and cross-tenant indicators.  

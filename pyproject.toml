@@ -1,6 +1,6 @@
 [project]
 name = "phish-analyzer"
-version = "0.4.8"
+version = "0.4.9a"
 description = "Email phishing analysis tool"
 authors = [
     { name="DC", email="dacraven95@gmail.com" }

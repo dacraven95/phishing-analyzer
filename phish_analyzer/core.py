@@ -1318,14 +1318,14 @@ def _svg_script_obfuscation_findings(svg_text_lower: str) -> List[Finding]:
 def analyze_pdf_bytes(data: bytes) -> list[Finding]:
     findings: list[Finding] = []
     
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        findings.append(Finding(
-            "pdf_parser_missing", 0,
-            "PDF deep inspection not available because 'pypdf' is not installed."
-        ))
-        return findings
+    # try:
+    #     from pypdf import PdfReader
+    # except Exception:
+    #     findings.append(Finding(
+    #         "pdf_parser_missing", 0,
+    #         "PDF deep inspection not available because 'pypdf' is not installed."
+    #     ))
+    #     return findings
 
     # Quick raw scan (cheap, catches many malicious PDFs even if parsing fails)
     raw_head = data[:500_000].lower()

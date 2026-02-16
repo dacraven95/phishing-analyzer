@@ -678,7 +678,7 @@ def _draw_summary_box(
             text_y -= 0.18 * inch
     else:
         c.setFillColor(colors.grey)
-        c.drawString(text_x, text_y, "No findings recorded.")
+        c.drawString(text_x, text_y, "No findings recorded. This feature is still under development.")
         text_y -= 0.18 * inch
 
     return box_bottom - 0.15 * inch
