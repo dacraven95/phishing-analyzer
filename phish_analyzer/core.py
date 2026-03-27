@@ -25,7 +25,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, urlunparse, parse_qs, unquote
 from enum import Enum
 from datetime import datetime
-from typing import Any, List, Dict, Optional, Tuple, Union
+from typing import Any, List, Dict, Optional, Tuple, Union, Iterable
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -214,6 +214,133 @@ ATTACHMENT_SIGNATURES = {
     ),
 }
 
+# Unicode ranges
+CYRILLIC_RE = re.compile(r'[\u0400-\u04FF]')
+LATIN_RE = re.compile(r'[A-Za-z]')
+
+# Characters commonly used in Cyrillic homoglyph attacks
+CYRILLIC_LOOKALIKES = {
+    'а': 'a',  # Cyrillic small a
+    'А': 'A',
+    'е': 'e',
+    'Е': 'E',
+    'о': 'o',
+    'О': 'O',
+    'р': 'p',
+    'Р': 'P',
+    'с': 'c',
+    'С': 'C',
+    'х': 'x',
+    'Х': 'X',
+    'у': 'y',
+    'У': 'Y',
+    'і': 'i',
+    'І': 'I',
+    'ј': 'j',
+    'Ј': 'J',
+    'ѕ': 's',
+    'ԁ': 'd',
+    'Ԍ': 'G',
+    'գ': 'g',
+    'ҡ': 'k',
+    'Կ': 'K',
+    'м': 'm',
+    'М': 'M',
+    'т': 't',
+    'Т': 'T',
+    'в': 'b',
+    'В': 'B',
+    'н': 'h',
+    'Н': 'H',
+    'к': 'k',
+    'К': 'K',
+}
+
+def contains_cyrillic(text: str) -> bool:
+    return bool(CYRILLIC_RE.search(text))
+
+
+def contains_latin(text: str) -> bool:
+    return bool(LATIN_RE.search(text))
+
+
+def decode_idn(domain: str) -> str:
+    """
+    Decode a punycode/IDN domain if possible.
+    If decoding fails, return the original string.
+    """
+    try:
+        return domain.encode("ascii").decode("idna")
+    except Exception:
+        return domain
+
+
+def normalize_homoglyphs(text: str) -> str:
+    """
+    Replace known Cyrillic homoglyphs with Latin lookalikes.
+    """
+    return ''.join(CYRILLIC_LOOKALIKES.get(ch, ch) for ch in text)
+
+def highlight_homoglyphs(domain: str) -> str:
+    return ''.join(
+        f"{ch}({CYRILLIC_LOOKALIKES.get(ch, '?')})"
+        if ch in CYRILLIC_LOOKALIKES
+        else ch
+        for ch in domain
+    )
+
+def detect_cyrillic_homoglyph_domain(domain: str) -> List["Finding"]:
+    findings: List["Finding"] = []
+
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return findings
+
+    try:
+        decoded_domain = domain.encode("ascii").decode("idna")
+    except Exception:
+        decoded_domain = domain
+
+    has_cyrillic = bool(CYRILLIC_RE.search(decoded_domain))
+    has_latin = bool(LATIN_RE.search(decoded_domain))
+
+    # 🔍 Extract exact Cyrillic characters found
+    cyrillic_chars = sorted(set(ch for ch in decoded_domain if CYRILLIC_RE.match(ch)))
+
+    # Map to Latin lookalikes if possible
+    char_mappings = [
+        f"{ch}→{CYRILLIC_LOOKALIKES.get(ch, '?')}"
+        for ch in cyrillic_chars
+    ]
+
+    is_punycode = any(part.startswith("xn--") for part in domain.split("."))
+
+    if is_punycode:
+        findings.append(Finding(
+            "punycode_domain",
+            30,
+            "Domain uses IDN/punycode encoding (possible spoofing)",
+            evidence=f"{domain} -> {decoded_domain}"
+        ))
+    
+    if has_cyrillic:
+        highlighted = highlight_homoglyphs(decoded_domain)
+        findings.append(Finding(
+            "cyrillic_characters_detected",
+            35 if has_latin else 20,
+            "Domain contains Cyrillic characters",
+            evidence=highlighted
+        ))
+
+    if has_cyrillic and has_latin:
+        findings.append(Finding(
+            "mixed_script_domain",
+            40,
+            "Domain contains mixed Latin and Cyrillic characters (possible homoglyph attack)",
+            evidence=decoded_domain
+        ))
+
+    return findings
 
 # optional: known-good company domains (can expand later)
 TRUSTED_BRAND_DOMAINS = {
@@ -2157,6 +2284,17 @@ def run_analysis(file_path: str,
         print(f"{BRIGHT_RED}Cross Tenant:           {cross_tenant}{RESET}")
     print(f"Reply-To domain:        {reply_to_domain}")
     print(f"Return-Path domain:     {return_path_domain}")
+    print()
+
+    print(f"{CYAN}=== Cyrillic Detection ==={RESET}")
+    cyrillic_from_domain = detect_cyrillic_homoglyph_domain(from_domain)
+    if cyrillic_from_domain:
+        for f in cyrillic_from_domain:
+            print(YELLOW + f.message + RESET)
+    else:
+        print(f"{YELLOW}[*] No cyrillic characters detected for {from_domain}{RESET}")
+    
+    print()
     print()
 
     WHITELIST_PATH = BASE_DIR / 'config' / 'domain-whitelist.txt'

@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.4.9a
+# 🛡️ Phishing Analyzer v0.5.0
 ### A lightweight command-line tool for analyzing email headers, email attachments, and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect emails' attachments and headers for suspicious patterns such as SPF failures, domain mismatches, suspicious filetypes, and cross-tenant indicators.  
@@ -37,7 +37,11 @@ Extracts and compares domains from:
 - `Reply-To`
 - `Return-Path`
 
-Flags mismatches that often occur in phishing emails.
+Detects Cyrillic Characters & Flags mismatches that often occur in phishing emails.
+```bash
+Domain contains Cyrillic characters
+    evidence: р(p)а(a)ypal.com
+```
 
 ### ✔ Terminal Output Enhancements
 - Colored output using ANSI escape codes.
