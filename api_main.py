@@ -1,17 +1,31 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security.api_key import APIKeyHeader
 
 import tempfile
 import os
 import traceback
 import asyncio
+import secrets
 
 from datetime import datetime
 
 from phish_analyzer.core import run_analysis_capture_text, run_analysis_and_pdf  # adjust import to match your structure
 
 app = FastAPI()
+
+# API Stuff
+API_KEY = os.getenv("API_KEY")
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def verify_api_key(key: str = Security(api_key_header)):
+    # If no API_KEY is present in the env, skip auth (dev purposes)
+    if not API_KEY:
+        return
+    if not key or not secrets.compare_digest(key, API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
 # Allow specific origins, or * for all
 app.add_middleware(
@@ -26,6 +40,7 @@ app.add_middleware(
 async def analyze_email(
     file: UploadFile = File(...),
     create_pdf: bool = Form(False),
+    _: None = Depends(verify_api_key),
 ):
     # 1) Validate file presence
     if file is None:

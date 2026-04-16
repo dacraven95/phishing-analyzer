@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.5.0
+# 🛡️ Phishing Analyzer v0.5.1
 ### A lightweight command-line tool for analyzing email headers, email attachments, and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect emails' attachments and headers for suspicious patterns such as SPF failures, domain mismatches, suspicious filetypes, and cross-tenant indicators.  
@@ -116,6 +116,13 @@ The API has a single endpoint `<your-ip>:8000/analyze` which returns the entire 
 
 The API docs are viewable at `<your-ip>:8000/docs` once you spin up the container.
 
+## Example curl command
+```bash
+curl -X POST https://your-server/analyze \
+  -H "X-API-Key: your-secret-key-here" \
+  -F "file=@email.eml"
+```
+
 ---
 
 ## 📄 Example Output
@@ -151,15 +158,10 @@ CrossTenant:        True
 
 ### 🔜 Coming Soon
 
-* HTML + text body extraction - ✔
-* URL detection - ✔
-* Domain reputation heuristics - ✔
 * Suspicious content rule engine
 * LLM-based tone/intent scoring
-* FastAPI REST API endpoint - ✔
 * Full risk scoring engine (0–100)
 * JSON output mode
-* Email attachment(s) analysis
 
 ---
 
