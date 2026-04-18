@@ -15,6 +15,7 @@ import contextlib
 import mimetypes
 import base64
 import quopri
+import hashlib
 
 from email import message_from_string, policy
 from email.policy import default as default_policy
@@ -1691,6 +1692,13 @@ def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
     score = max(0, min(100, score))
     return score, findings
 
+def get_attachment_hashes(file_bytes: bytes) -> dict:
+    return {
+        "md5":      hashlib.md5(file_bytes).hexdigest(),
+        "sha1":     hashlib.sha1(file_bytes).hexdigest(),
+        "sha256":   hashlib.sha256(file_bytes).hexdigest(),
+    }
+
 def diagnose_eml(eml_file_path):
     """
     Examine the .eml file in multiple ways to understand its structure
@@ -2049,10 +2057,12 @@ def run_analysis(file_path: str,
                 print(f"\nAttachment: {attachment['filename']}")
                 print(f"Declared MIME: {attachment['content_type']}")
                 print(f"Size: {attachment['size']} bytes")
+                print()
+                print(f"Hashes: {get_attachment_hashes(attachment['payload'])}")
 
                 print()
                 print()
-                payload_preview = attachment["payload"][:1000]
+                payload_preview = attachment['payload'][:500]
                 print(BRIGHT_BLUE + f"Payload (1000 chars): {payload_preview}" + RESET)
                 print()
                 print()
