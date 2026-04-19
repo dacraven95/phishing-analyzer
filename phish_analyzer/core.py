@@ -15,7 +15,6 @@ import contextlib
 import mimetypes
 import base64
 import quopri
-import hashlib
 
 from email import message_from_string, policy
 from email.policy import default as default_policy
@@ -141,6 +140,13 @@ SUSPICIOUS_PATH_KEYWORDS = [
     "billing", "account", "confirm", "webscr"
 ]
 
+SUSPICIOUS_MAILERS = [
+    "the bat", "evolution", "mutt", "alpine",
+    "phpmailer", "swiftmailer", "sendgrid",
+    "mailchimp", "python", "php", "ruby",
+    "curl", "libwww", "massmailer"
+]
+
 BRAND_KEYWORDS = [
     "paypal", "microsoft", "office365", "outlook", "apple", "google",
     "amazon", "bankofamerica", "chase", "wellsfargo"
@@ -260,10 +266,8 @@ CYRILLIC_LOOKALIKES = {
 def contains_cyrillic(text: str) -> bool:
     return bool(CYRILLIC_RE.search(text))
 
-
 def contains_latin(text: str) -> bool:
     return bool(LATIN_RE.search(text))
-
 
 def decode_idn(domain: str) -> str:
     """
@@ -274,7 +278,6 @@ def decode_idn(domain: str) -> str:
         return domain.encode("ascii").decode("idna")
     except Exception:
         return domain
-
 
 def normalize_homoglyphs(text: str) -> str:
     """
@@ -423,7 +426,6 @@ def has_hidden_attachment(raw: bytes) -> bool:
 
     # Tunable threshold
     return sum(hits.values()) >= 3
-
 
 def load_email(path):
     with open(path, "rb") as f:
@@ -1007,20 +1009,6 @@ def get_email_body(file_path):
 
     return email_body
 
-    # Check for file type .eml, .txt and parse message
-    msg = parse_detected_filetype(ext, file_path)
-
-    plain_body, html_body = extract_bodies(msg)
-
-    email_body = None
-
-    if plain_body:
-        email_body = plain_body or None
-    if html_body:
-        email_body = html_body or None
-
-    return email_body
-
 def get_headers(file_path, header: str = None):
     
     # Check if header was passed in and cancel if not
@@ -1032,11 +1020,6 @@ def get_headers(file_path, header: str = None):
     selected_hdr = msg.get_all(header) or []
     return selected_hdr
 
-    headers = parse_detected_filetype(ext, file_path)
-    selected_hdr = headers.get_all(header) or []
-
-    return selected_hdr
-
 def get_header(file_path, header: str = None):
     
     # Check if header was passed in and cancel if not
@@ -1046,11 +1029,6 @@ def get_header(file_path, header: str = None):
     # Get file extension
     msg = _get_cached_parsed_message(file_path)
     return msg[header] or None
-
-    headers = parse_detected_filetype(ext, file_path)
-    selected_hdr = headers[header] or None
-
-    return selected_hdr
 
 _RX_FROM = re.compile(r"\bfrom\s+([^\s;]+)", re.IGNORECASE)
 _RX_BY = re.compile(r"\bby\s+([^\s;]+)", re.IGNORECASE)
@@ -1996,7 +1974,8 @@ def detect_bad_epilogue(file_path):
 
 def run_analysis(file_path: str,
                  use_json: bool = False,
-                 show_spinners: bool = True):
+                 show_spinners: bool = True,
+                 show_mime: bool = False):
 
     print_banner()
     analysis_results = []
@@ -2015,9 +1994,10 @@ def run_analysis(file_path: str,
     print()
 
     # --- MIME tree
-    print(YELLOW + "[*] Analyzing MIME Data" + RESET)
-    dump_mime_tree_plus(raw)
-    print()
+    if show_mime:
+        print(YELLOW + "[*] Analyzing MIME Data" + RESET)
+        dump_mime_tree_plus(raw)
+        print()
 
     # Extract attachments from the email file
     print(YELLOW + '[*] Attachment scanning...' + RESET)
@@ -2062,10 +2042,10 @@ def run_analysis(file_path: str,
 
                 print()
                 print()
-                payload_preview = attachment['payload'][:500]
-                print(BRIGHT_BLUE + f"Payload (1000 chars): {payload_preview}" + RESET)
-                print()
-                print()
+                # payload_preview = attachment['payload'][:500].decode('utf-8', errors='replace')
+                # print(BRIGHT_BLUE + f"Payload Preview: {payload_preview}" + RESET)
+                # print()
+                # print()
 
                 print(BRIGHT_YELLOW + f"Total Findings: {len(findings)}" + RESET)
                 for f in findings[:10]:
@@ -2092,6 +2072,10 @@ def run_analysis(file_path: str,
     # Pull Headers from Headers Block
     # ----------------------------------------------------------
 
+    x_mailer_hdr = get_header(file_path, "X-Mailer")
+    user_agent_hdr = get_header(file_path, "User-Agent")
+    mailer_value = x_mailer_hdr or user_agent_hdr
+
     #received_from_hdr = msg.get_all("Received") or []
     received_from_hdr = get_headers(file_path, "Received")
 
@@ -2116,6 +2100,26 @@ def run_analysis(file_path: str,
 
     # ----------------------------------------------------------
     # END - Pull Headers from Headers Block
+    # ----------------------------------------------------------
+
+    # ----------------------------------------------------------
+    # Check for Mailer or User-Agent Headers
+    # ----------------------------------------------------------
+
+    if not mailer_value:
+        print(f"{BRIGHT_YELLOW}[*] No X-Mailer or User-Agent header found{RESET}")
+    else:
+        lower = mailer_value.lower()
+        matched = [m for m in SUSPICIOUS_MAILERS if m in lower]
+
+        if matched:
+            reason = f"{BRIGHT_RED}[!] Matched suspicious mailer pattern(s): {matched} {RESET}"
+            print(reason)
+        else:
+            print(f"{BRIGHT_GREEN}[+] Mailer identified: {mailer_value}{RESET}")
+
+    # ----------------------------------------------------------
+    # END - Check for Mailer or User-Agent Headers
     # ----------------------------------------------------------
 
     # Check for file type .eml, .txt and parse message
@@ -2433,13 +2437,13 @@ def run_analysis(file_path: str,
 {RESET}
 """)
 
-def run_analysis_and_pdf(file_path: str, pdf_path: str):
+def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
     analysis_results = []  # your existing findings list
 
     email_body = get_email_body(file_path)
 
     # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False)
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False, show_mime=show_mime)
 
     hops = parse_received_hops(get_headers(file_path, "Received"))
 
@@ -2467,7 +2471,8 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str):
 
 def run_analysis_capture_text(file_path: str,
                               use_json: bool = False,
-                              strip_ansi: bool = True) -> str:
+                              strip_ansi: bool = True,
+                              show_mime: bool = False) -> str:
     """
     Run the analysis and capture the full terminal-style output
     as a single string, instead of printing it to the real terminal.
@@ -2475,7 +2480,7 @@ def run_analysis_capture_text(file_path: str,
     buffer = io.StringIO()
     # Redirect stdout into our buffer while run_analysis executes
     with contextlib.redirect_stdout(buffer):
-        run_analysis(file_path, use_json=use_json, show_spinners=False)
+        run_analysis(file_path, use_json=use_json, show_spinners=False, show_mime=show_mime)
 
     # Get everything that was printed
     output = buffer.getvalue()

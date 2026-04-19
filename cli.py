@@ -13,6 +13,7 @@ def main():
     parser.add_argument("--no-color", action="store_true", help="Do not color terminal output (NOT WORKING AT THE MOMENT)")
     parser.add_argument("-r","--report", action="store_true", help="Generate a PDF report instead of terminal output")
     parser.add_argument("-o","--output", type=str, help="Path to write the generated PDF report (CLI only)")
+    parser.add_argument("-m", "--mime", action="store_true", help="Dump email MIME data on output")
 
     args = parser.parse_args()
 
@@ -43,7 +44,7 @@ def main():
 
     # Call run_analysis() and let it print
     if not args.report:
-        run_analysis(file_path, use_json=args.json)
+        run_analysis(file_path, use_json=args.json, show_mime=args.mime)
     else:
         now = datetime.now()
         filename_timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -57,7 +58,7 @@ def main():
         print("Starting Analysis with PDF Report Generation...")
         spinner = Halo(text="Analyzing email", spinner="dots")
         spinner.start()
-        run_analysis_and_pdf(args.file, pdf_path)
+        run_analysis_and_pdf(args.file, pdf_path, show_mime=args.mime)
         spinner.stop()
         print(f"Report Generated: {pdf_path}")
 
