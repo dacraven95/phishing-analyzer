@@ -36,6 +36,7 @@ import dns.resolver
 
 # first party imports
 from phish_analyzer.rdapHelper import lookup_rdap
+from phish_analyzer.social_engineering import score_social_engineering, SEResult
 
 # Local imports
 from .colors import RED, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE, BRIGHT_YELLOW
@@ -66,7 +67,6 @@ def _get_cached_parsed_message(file_path: str) -> Message:
     msg = parse_detected_filetype(ext, file_path)
     _PARSED_MSG_CACHE[file_path] = (mtime, msg)
     return msg
-
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -2423,6 +2423,47 @@ def run_analysis(file_path: str,
     # Print if no SPF Headers are found
     if hasSPFHeaders is False:
         print(YELLOW + '[*] No SPF Headers Found' + RESET)
+
+
+    # ----------------------------------------------------------
+    # Social Engineering Scoring
+    # ----------------------------------------------------------
+    print(f"{CYAN}=== Social Engineering Analysis ==={RESET}")
+
+    se_result = score_social_engineering(
+        plain_body=plain_body,
+        html_body=html_body,
+        subject=subject_hdr,
+    )
+
+    # Pick a color based on grade
+    SE_COLORS = {
+        "CRITICAL": BRIGHT_RED,
+        "HIGH":     RED,
+        "MEDIUM":   YELLOW,
+        "LOW":      BRIGHT_YELLOW,
+        "MINIMAL":  BRIGHT_GREEN,
+    }
+    grade_color = SE_COLORS.get(se_result.grade, RESET)
+
+    print(f"Social Engineering Score:  {grade_color}{se_result.score}/100 [{se_result.grade}]{RESET}")
+    print(f"Summary: {se_result.summary}")
+
+    if se_result.triggers:
+        # Group by cluster for cleaner output
+        from itertools import groupby
+        sorted_triggers = sorted(se_result.triggers, key=lambda t: t.cluster)
+        
+        print()
+        for cluster, group in groupby(sorted_triggers, key=lambda t: t.cluster):
+            group_list = list(group)
+            total_weight = sum(t.weight for t in group_list)
+            print(f"  {YELLOW}[+{total_weight}] {cluster}{RESET}")
+            for trigger in group_list[:3]:  # cap to 3 per cluster in CLI output
+                print(f"      phrase:  \"{trigger.phrase}\"")
+                print(f"      context: {trigger.context[:120]}")
+    print()
+
 
     # pretty-print JSON for now (CLI use)
     if use_json:
