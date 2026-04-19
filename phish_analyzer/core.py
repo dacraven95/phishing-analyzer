@@ -44,6 +44,8 @@ from phish_analyzer.threat_intel import (
     correlate_all,
     print_correlation_results,
 )
+from phish_analyzer.attack_mapping import format_attack_output
+from phish_analyzer.yara_scanner import scan_email_components, format_yara_output
 
 # Local imports
 from .colors import RED, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE, BRIGHT_YELLOW
@@ -1991,7 +1993,11 @@ def run_analysis(file_path: str,
                  show_mime: bool = False):
 
     print_banner()
+
     analysis_results = []
+
+    # Track all finding codes for ATT&CK mapping at the end
+    attack_finding_codes: list[str] = []
 
     # Load message for later
     message, raw = load_email(file_path)
@@ -2173,6 +2179,22 @@ def run_analysis(file_path: str,
             for item in url_analysis:
                 url = item["url"]
                 flags = item["flags"]
+
+                for flag in flags:
+                    if flag == "IP_LITERAL":
+                        attack_finding_codes.append("URL_IP_LITERAL")
+                    elif flag == "SUSPICIOUS_TLD":
+                        attack_finding_codes.append("URL_SUSPICIOUS_TLD")
+                    elif flag == "PUNYCODE_DOMAIN":
+                        attack_finding_codes.append("URL_PUNYCODE")
+                    elif flag == "OBFUSCATED_PATH":
+                        attack_finding_codes.append("URL_OBFUSCATED_PATH")
+                    elif flag.startswith("BRAND_IMPERSONATION"):
+                        attack_finding_codes.append("URL_BRAND_IMPERSONATION")
+                    elif flag.startswith("KEYWORD_"):
+                        attack_finding_codes.append("URL_SUSPICIOUS_PATH")
+
+
                 if flags:
                     print(f" - {url}")
                     print(f"   Flags: {', '.join(flags)}")
@@ -2308,6 +2330,7 @@ def run_analysis(file_path: str,
     if from_domain != to_domain and cross_tenant:
         print(f"{BRIGHT_GREEN}Cross Tenant:           {cross_tenant}{RESET}")
     if from_domain == to_domain and cross_tenant:
+        attack_finding_codes.append("CROSSTENANT_PRESENT")
         print(f"{BRIGHT_RED}Cross Tenant:           {cross_tenant}{RESET}")
     print(f"Reply-To domain:        {reply_to_domain}")
     print(f"Return-Path domain:     {return_path_domain}")
@@ -2317,6 +2340,7 @@ def run_analysis(file_path: str,
     cyrillic_from_domain = detect_cyrillic_homoglyph_domain(from_domain)
     if cyrillic_from_domain:
         for f in cyrillic_from_domain:
+            attack_finding_codes.append(f.code)
             print(YELLOW + f.message + RESET)
     else:
         print(f"{YELLOW}[*] No cyrillic characters detected for {from_domain}{RESET}")
@@ -2391,6 +2415,8 @@ def run_analysis(file_path: str,
     if auth_results_headers:
         print(f"{CYAN}=== Parsed Authentication Results ==={RESET}")
         print(f"spf: {auth_spf}")
+        if auth_dkim == "fail":
+            attack_finding_codes.append("DKIM_FAIL")
         print(f"dkim: {auth_dkim}")
         print(f"dmarc: {auth_dmarc}")
         print()
@@ -2412,10 +2438,12 @@ def run_analysis(file_path: str,
         if parsed_spf_hdr['result'] == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
             print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
             if parsed_spf_hdr['result'] == "fail" or auth_spf == 'fail':
+                attack_finding_codes.append(f"SPF_FAIL")
                 print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']} for domain -> {from_domain}")
             if org_authAs_hdr == "Anonymous":
                 print(f"AuthAs -> {org_authAs_hdr}")
             if auth_dmarc == 'fail':
+                attack_finding_codes.append("DMARC_FAIL")
                 print(f"DMARC Check -> {auth_dmarc}")
             print()
 
@@ -2467,6 +2495,9 @@ def run_analysis(file_path: str,
         from itertools import groupby
         sorted_triggers = sorted(se_result.triggers, key=lambda t: t.cluster)
         
+        for trigg in se_result.triggers:
+            attack_finding_codes.append(f"SE_{trigg.cluster}")
+
         print()
         for cluster, group in groupby(sorted_triggers, key=lambda t: t.cluster):
             group_list = list(group)
@@ -2542,6 +2573,41 @@ def run_analysis(file_path: str,
             mailer=get_header(file_path, "X-Mailer") or get_header(file_path, "User-Agent"),
         )
 
+    # ----------------------------------------------------------
+    # YARA Rule Scanning
+    # ----------------------------------------------------------
+    yara_matches = scan_email_components(
+        plain_body=plain_body,
+        html_body=html_body,
+        attachments=attachments if attachments else [],
+    )
+
+    print(format_yara_output(yara_matches, {
+        "CYAN":         CYAN,
+        "YELLOW":       YELLOW,
+        "RED":          RED,
+        "BRIGHT_RED":   BRIGHT_RED,
+        "BRIGHT_GREEN": BRIGHT_GREEN,
+        "RESET":        RESET,
+    }))
+
+    # Feed YARA findings into ATT&CK mapping
+    for match in yara_matches:
+        attack_finding_codes.append(f"YARA_{match.rule_name}")
+        # Also feed the technique IDs directly since YARA rules declare them
+        for attack_id in match.attack_ids:
+            attack_finding_codes.append(attack_id)
+
+    # ----------------------------------------------------------
+    # MITRE ATT&CK Coverage
+    # ----------------------------------------------------------
+    print(format_attack_output(attack_finding_codes, {
+        "CYAN":         CYAN,
+        "YELLOW":       YELLOW,
+        "BRIGHT_RED":   BRIGHT_RED,
+        "BRIGHT_GREEN": BRIGHT_GREEN,
+        "RESET":        RESET,
+    }))
 
     # pretty-print JSON for now (CLI use)
     if use_json:

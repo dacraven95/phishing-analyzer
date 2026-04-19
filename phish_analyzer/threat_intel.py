@@ -3,6 +3,7 @@ Local Threat Intelligence Engine
 Stores and correlates indicators of compromise (IOCs) across analyses.
 """
 from __future__ import annotations
+import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime

@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.5.1
+# 🛡️ Phishing Analyzer v0.5.2
 ### A lightweight command-line tool for analyzing email headers, email attachments, and identifying phishing indicators.
 
 Phishing Analyzer helps security analysts, IT admins, and researchers inspect emails' attachments and headers for suspicious patterns such as SPF failures, domain mismatches, suspicious filetypes, and cross-tenant indicators.  
@@ -9,13 +9,17 @@ You can view a live web demo running at: [https://demo.phishing-analyzer.com/](h
 
 ---
 
-## 🚀 Features (Current)
+## 🚀 Features
+
+### ✔ YARA & MITRE
+- Supports YARA & MITRE ATT&CK Rules
+- Custom YARA rules added via the `yara_rules` folder
 
 ### ✔ Email Header Parsing
 - Supports both **raw header text files** and full **`.eml`** email files.
 - Automatically extracts the header block even if extra text appears before/after.
 
-### ✔ Basic Email Attachment Analysis (upgrades coming soon)
+### ✔ Basic Email Attachment Analysis
 - Analyzes attachments based on **actual content**, not filenames alone.
 - Detects **embedded scripts**, inline SVG, and hidden active payloads.
 - Flags **obfuscated JavaScript loaders** commonly used in phishing emails.
