@@ -37,6 +37,47 @@ Extracts and compares domains from:
 - `Reply-To`
 - `Return-Path`
 
+### ✔ Local Threat Intel DB Memory
+- Uses a `sqlite3` db file to store IOCs longterm
+- Alerts you in the cli output if an IOC has been seen
+- Ability to search through intel via cli flags
+```bash
+# Analyze an email as normal — IOCs saved automatically
+python cli.py -f suspicious.eml
+
+# List your 20 most recent analyses
+python cli.py --list
+
+# List analyses for a specific campaign
+python cli.py --list DocuSign-Spoof
+
+# Tag a single analysis by its ID
+python cli.py --tag 7 DocuSign-Spoof
+
+# Tag every analysis that contains a specific indicator
+python cli.py --tag-indicator 0.0.0.0 DocuSign-Spoof
+
+# View all campaign tags and counts
+python cli.py --campaigns
+
+# Dump every IOC associated with a campaign
+python cli.py --campaign-iocs DocuSign-Spoof
+```
+- Export Threat Intel to JSON or CSV
+```bash
+# Export everything as JSON
+python cli.py --export json
+
+# Export a specific campaign as STIX for sharing with your SOC
+python cli.py --export stix --export-campaign DocuSign-Spoof
+
+# Export all domains and hashes as CSV into a specific folder
+python cli.py --export csv --export-output ./exports
+
+# Export a campaign as JSON to a specific folder
+python cli.py --export json --export-campaign HR-Payroll-Phish --export-output ./exports
+```
+
 Detects Cyrillic Characters & Flags mismatches that often occur in phishing emails.
 ```bash
 Domain contains Cyrillic characters

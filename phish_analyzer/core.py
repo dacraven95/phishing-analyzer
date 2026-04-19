@@ -37,10 +37,23 @@ import dns.resolver
 # first party imports
 from phish_analyzer.rdapHelper import lookup_rdap
 from phish_analyzer.social_engineering import score_social_engineering, SEResult
+from phish_analyzer.threat_intel import (
+    initialize_database,
+    save_analysis,
+    extract_and_save_iocs,
+    correlate_all,
+    print_correlation_results,
+)
 
 # Local imports
 from .colors import RED, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE, BRIGHT_YELLOW
 from .pdfReport import generate_pdf_report
+
+# Init sqlite DB
+initialize_database()
+
+# Enable/Disable Threat Intel DB functionality
+THREAT_INTEL_ENABLED = os.getenv("THREAT_INTEL_ENABLED", "true").lower() == "true"
 
 BASE_DIR = Path(__file__).resolve().parent
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -2463,6 +2476,71 @@ def run_analysis(file_path: str,
                 print(f"      phrase:  \"{trigger.phrase}\"")
                 print(f"      context: {trigger.context[:120]}")
     print()
+
+
+    # ----------------------------------------------------------
+    # Threat Intelligence Correlation
+    # ----------------------------------------------------------
+    if THREAT_INTEL_ENABLED:
+
+        ti_matches = correlate_all(
+            from_domain=from_domain,
+            reply_domain=reply_to_domain,
+            return_domain=return_path_domain,
+            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
+            urls=found_URLS if found_URLS else [],
+            attachments=attachments if attachments else [],
+        )
+
+        print_correlation_results(ti_matches, {
+            "RED":          RED,
+            "YELLOW":       YELLOW,
+            "CYAN":         CYAN,
+            "BRIGHT_RED":   BRIGHT_RED,
+            "BRIGHT_GREEN": BRIGHT_GREEN,
+            "RESET":        RESET,
+        })
+
+        # save IOCs AFTER correlation so current run doesn't match itself
+        analysis_id = save_analysis(
+            file_name=file_path,
+            risk_score=None,
+            se_score=se_result.score if 'se_result' in dir() else None,
+            verdict=None,
+        )
+
+        extract_and_save_iocs(
+            analysis_id=analysis_id,
+            from_domain=from_domain,
+            reply_domain=reply_to_domain,
+            return_domain=return_path_domain,
+            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
+            urls=found_URLS if found_URLS else [],
+            attachments=attachments if attachments else [],
+            mailer=get_header(file_path, "X-Mailer") or get_header(file_path, "User-Agent"),
+        )
+
+        # ----------------------------------------------------------
+        # Save IOCs to local threat intel database
+        # ----------------------------------------------------------
+
+        analysis_id = save_analysis(
+            file_name=file_path,
+            risk_score=None,   # swap in your computed score when you build the global scorer
+            se_score=se_result.score if 'se_result' in dir() else None,
+            verdict=None,      # same — wire in when you have it
+        )
+
+        extract_and_save_iocs(
+            analysis_id=analysis_id,
+            from_domain=from_domain,
+            reply_domain=reply_to_domain,
+            return_domain=return_path_domain,
+            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
+            urls=found_URLS if found_URLS else [],
+            attachments=attachments if attachments else [],
+            mailer=get_header(file_path, "X-Mailer") or get_header(file_path, "User-Agent"),
+        )
 
 
     # pretty-print JSON for now (CLI use)

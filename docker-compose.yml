@@ -7,3 +7,6 @@ services:
     restart: unless-stopped
     environment:
      - API_KEY=your-secret-key-here
+     - THREAT_INTEL_ENABLED=false # Set to true in your own private instance
+    volumes:
+     - ./phish_analyzer/config:/app/phish_analyzer/config

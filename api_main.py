@@ -41,6 +41,7 @@ async def analyze_email(
     file: UploadFile = File(...),
     create_pdf: bool = Form(False),
     _: None = Depends(verify_api_key),
+    show_mime: bool = Form(False),
 ):
     # 1) Validate file presence
     if file is None:
@@ -66,7 +67,7 @@ async def analyze_email(
         # 3) If PDF requested in the form field
         if create_pdf:
             pdf_path = os.path.join(os.getcwd(), "report.pdf")
-            await asyncio.to_thread(run_analysis_and_pdf, tmp_path, pdf_path)
+            await asyncio.to_thread(run_analysis_and_pdf, tmp_path, pdf_path, show_mime)
 
             return FileResponse(
                 path=pdf_path,
