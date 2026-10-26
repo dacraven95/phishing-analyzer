@@ -15,6 +15,8 @@ import contextlib
 import mimetypes
 import base64
 import quopri
+from functools import lru_cache
+from time import monotonic
 
 from email import message_from_string, policy
 from email.policy import default as default_policy
@@ -34,6 +36,12 @@ from pathlib import Path
 from halo import Halo
 import dns.resolver
 
+try:
+    from pypdf import PdfReader
+except ImportError:
+    # Basic PDF signature inspection still works without the optional parser.
+    PdfReader = None
+
 # first party imports
 from phish_analyzer.rdapHelper import lookup_rdap
 from phish_analyzer.social_engineering import score_social_engineering, SEResult
@@ -51,37 +59,23 @@ from phish_analyzer.yara_scanner import scan_email_components, format_yara_outpu
 from .colors import RED, YELLOW, RESET, CYAN, BRIGHT_GREEN, BRIGHT_RED, BRIGHT_BLUE, BRIGHT_WHITE, BRIGHT_YELLOW
 from .pdfReport import generate_pdf_report
 
-# Init sqlite DB
-initialize_database()
-
 # Enable/Disable Threat Intel DB functionality
 THREAT_INTEL_ENABLED = os.getenv("THREAT_INTEL_ENABLED", "true").lower() == "true"
 
+# Do not create or touch the database when threat intelligence is disabled.
+if THREAT_INTEL_ENABLED:
+    initialize_database()
+
 BASE_DIR = Path(__file__).resolve().parent
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+MAX_DEEP_SCAN_BYTES = 12 * 1024 * 1024
+MAX_EMAIL_BYTES = 25 * 1024 * 1024
 
-# Parsing header blocks / full EML repeatedly is expensive. These helpers cache the
-# parsed Message object keyed by file path + mtime.
-_PARSED_MSG_CACHE: dict[str, tuple[float, Message]] = {}
-
-
+# Emails can contain sensitive data and attachments. Do not retain parsed messages
+# in a process-global cache beyond a request; run_analysis reuses its own Message.
 def _get_cached_parsed_message(file_path: str) -> Message:
-    """Parse the email/headers file once per mtime and reuse the Message."""
-    try:
-        mtime = Path(file_path).stat().st_mtime
-    except Exception:
-        # Fall back to uncached parse if we can't stat the file.
-        ext = get_file_extension(file_path)
-        return parse_detected_filetype(ext, file_path)
-
-    cached = _PARSED_MSG_CACHE.get(file_path)
-    if cached and cached[0] == mtime:
-        return cached[1]
-
-    ext = get_file_extension(file_path)
-    msg = parse_detected_filetype(ext, file_path)
-    _PARSED_MSG_CACHE[file_path] = (mtime, msg)
-    return msg
+    """Compatibility helper; parse the requested message without global caching."""
+    return parse_detected_filetype(get_file_extension(file_path), file_path)
 
 class Category(str, Enum):
     HEADERS = "headers"
@@ -444,13 +438,17 @@ def has_hidden_attachment(raw: bytes) -> bool:
 
 def load_email(path):
     with open(path, "rb") as f:
-        raw = f.read()
+        raw = f.read(MAX_EMAIL_BYTES + 1)
+    if len(raw) > MAX_EMAIL_BYTES:
+        raise ValueError("Email exceeds the 25 MiB analysis limit")
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     return msg, raw
 
 def load_email_lenient_with_raw(path: str):
     with open(path, "rb") as f:
-        raw = f.read()
+        raw = f.read(MAX_EMAIL_BYTES + 1)
+    if len(raw) > MAX_EMAIL_BYTES:
+        raise ValueError("Email exceeds the 25 MiB analysis limit")
 
     strict_msg = BytesParser(policy=policy.default).parsebytes(raw)
     lenient_msg = BytesParser(policy=policy.compat32).parsebytes(raw)
@@ -472,6 +470,8 @@ def salvage_pdf_attachments_from_raw(raw_bytes: bytes):
 
     for match in PDF_BLOCK_RE.finditer(raw_bytes):
         b64_blob = match.group(1)
+        if len(b64_blob) > (MAX_DEEP_SCAN_BYTES * 4 // 3) + 16:
+            continue
 
         try:
             pdf_bytes = base64.b64decode(b64_blob, validate=False)
@@ -544,9 +544,32 @@ def extract_header_block(raw: str) -> str:
     return "\n".join(header_lines)
 
 def parse_full_eml(path: str):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        raw = f.read()
-    return message_from_string(raw, policy=default_policy)
+    # Parse original bytes so non-UTF-8 MIME data is not irreversibly replaced.
+    with open(path, "rb") as f:
+        raw = f.read(MAX_EMAIL_BYTES + 1)
+    if len(raw) > MAX_EMAIL_BYTES:
+        raise ValueError("Email exceeds the 25 MiB analysis limit")
+    return BytesParser(policy=default_policy).parsebytes(raw)
+
+def _read_text_part(part: Message) -> str:
+    """Decode a text MIME part without aborting on malformed declared charsets."""
+    try:
+        content = part.get_content()
+        if isinstance(content, str):
+            return content
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+    except (LookupError, UnicodeError, ValueError, TypeError):
+        pass
+    payload = part.get_payload(decode=True) or b""
+    if isinstance(payload, bytes):
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            return payload.decode(charset, errors="replace")
+        except (LookupError, UnicodeError):
+            return payload.decode("utf-8", errors="replace")
+    return ""
+
 
 def extract_bodies(msg):
     """
@@ -568,23 +591,19 @@ def extract_bodies(msg):
                 continue
 
             if ctype == "text/plain" and plain_body is None:
-                plain_body = part.get_content()
+                plain_body = _read_text_part(part)
             elif ctype == "text/html" and html_body is None:
-                html_body = part.get_content()
+                html_body = _read_text_part(part)
     else:
 
-        content = msg.get_content()
-        if isinstance(content, bytes):
-            content_str = content.decode(errors="ignore")
-        else:
-            content_str = content or ""
+        content_str = _read_text_part(msg)
 
         # Single-part message
         ctype = msg.get_content_type()
         if ctype == "text/plain" and "<html" not in content_str.lower():
-            plain_body = msg.get_content()
+            plain_body = content_str
         elif ctype == "text/html" or "<html" in content_str.lower():
-            html_body = msg.get_content()
+            html_body = content_str
 
     return plain_body, html_body
 
@@ -642,52 +661,44 @@ def extract_hrefs_from_html(html_body: str | None):
 
 def normalize_url(url: str) -> str | None:
     """
-    Normalize a URL string for consistent comparison/storage.
-
-    - Strips surrounding whitespace and trailing punctuation.
-    - Adds http:// if it starts with 'www.' and has no scheme.
-    - Lowercases scheme and host.
-    - Removes default ports (:80 for http, :443 for https).
-    - Drops fragment (#...).
+    Normalize an HTTP(S) URL without treating relative paths or unsupported
+    schemes as network destinations. Preserve its path and query for analysis.
     """
-    if not url:
+    if not isinstance(url, str) or not url:
         return None
 
-    # Basic cleanup
-    url = url.strip()
-    # Strip common trailing punctuation that often follows pasted URLs
-    url = url.rstrip(").,;]\"'")
-
-    # Ignore obvious non-http(s) schemes (you can expand this later)
-    if url.startswith(("mailto:", "javascript:", "data:")):
+    url = url.strip().rstrip(").,;\"'")
+    # A terminal ']' may close a literal IPv6 host, not punctuation.
+    if url.endswith("]") and not re.fullmatch(r"https?://\[[^]]+\]", url, re.IGNORECASE):
+        url = url.rstrip("]")
+    if not url or len(url) > 8192 or any(ord(ch) < 32 for ch in url):
         return None
 
-    # If it starts with www. but has no scheme, add http:// for parsing
-    if url.startswith("www."):
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.lower().startswith("www."):
         url = "http://" + url
 
-    parsed = urlparse(url)
-
-    # If still no netloc, maybe it's something weird; bail out
-    if not parsed.netloc and not parsed.path:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        if not parsed.hostname or parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return None
+        # Guard against malformed host labels and invalid IPv6 bracket syntax.
+        if any(ch.isspace() for ch in parsed.hostname):
+            return None
+    except ValueError:
         return None
 
-    scheme = (parsed.scheme or "http").lower()
+    scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
-
-    # Remove default ports
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     elif netloc.endswith(":443") and scheme == "https":
         netloc = netloc[:-4]
 
-    # Ensure we always have some path
-    path = parsed.path or "/"
-
-    # Rebuild without fragment
-    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
-
-    return normalized
+    return urlunparse((scheme, netloc, parsed.path or "/", parsed.params, parsed.query, ""))
 
 def is_ip_literal_url(url: str) -> bool:
     """
@@ -728,6 +739,10 @@ def analyze_url(url: str, analysis_results) -> dict:
         "flags": [...],
     }
     """
+    normalized = normalize_url(url)
+    if normalized is None:
+        return {"url": url, "domain": "", "flags": ["INVALID_URL"]}
+    url = normalized
     parsed = urlparse(url)
     host = parsed.hostname or ""
     domain = host.lower()
@@ -835,6 +850,8 @@ def parse_headers_from_file(path: str):
     :param path: Path to headers text file.
     :type path: str
     """
+    if Path(path).stat().st_size > MAX_EMAIL_BYTES:
+        raise ValueError("Email exceeds the 25 MiB analysis limit")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         raw = f.read()
 
@@ -844,7 +861,7 @@ def parse_headers_from_file(path: str):
     msg = message_from_string(header_block, policy=default_policy)
     return msg
 
-def get_domain_from_address(header_value: str | None) -> str | None:
+def get_domain_from_address(header_value: str | None) -> tuple[str | None, str | None]:
     """
     Extract domain from an email address header like 'Name <user@example.com>'
 
@@ -882,8 +899,14 @@ def parse_received_spf(spf_header: str):
     result = result_match.group(1).lower() if result_match else None
 
     # Extract client-ip=...
-    ip_match = re.search(r"client-ip=([\d\.]+)", spf_header)
-    client_ip = ip_match.group(1) if ip_match else None
+    ip_match = re.search(r"\bclient-ip\s*=\s*([^;\s)]+)", spf_header, re.IGNORECASE)
+    client_ip = None
+    if ip_match:
+        candidate = ip_match.group(1).strip("[]")
+        try:
+            client_ip = str(ipaddress.ip_address(candidate))
+        except ValueError:
+            pass
 
     return {
         "result": result,
@@ -920,37 +943,44 @@ def has_crosstenant_headers(headers: dict) -> bool:
             return True
     return False
 
-def safe_dns_query(domain: str, record_type: str):
-    """
-    Perform a DNS query safely and return:
-      - list of answers, or
-      - None if not found / error
-
-    Does NOT raise exceptions.
-    """
+def _normalized_dns_domain(domain: str | None) -> str | None:
+    """Accept only hostname-like DNS targets from untrusted message headers."""
+    if not isinstance(domain, str):
+        return None
     try:
-        answers = dns.resolver.resolve(domain, record_type)
-        return [r.to_text() for r in answers]
-
-    except dns.resolver.NoAnswer:
-        # Domain exists, but record type doesn't
+        ascii_domain = domain.strip().rstrip(".").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
         return None
-
-    except dns.resolver.NXDOMAIN:
-        # Domain does not exist at all
+    if not ascii_domain or len(ascii_domain) > 253:
         return None
-
-    except dns.resolver.NoNameservers:
-        # Nameserver exists but cannot answer
+    labels = ascii_domain.split(".")
+    if len(labels) < 2 or any(
+        not label or len(label) > 63
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    ):
         return None
+    return ascii_domain
 
-    except dns.exception.Timeout:
-        # DNS resolution timed out
-        return None
 
-    except Exception:
-        # Catch-all safety fallback
+@lru_cache(maxsize=256)
+def _cached_dns_query(domain: str, record_type: str, time_bucket: int) -> tuple[str, ...]:
+    """Limit DNS latency and cache successes/failures for at most five minutes."""
+    try:
+        answers = dns.resolver.resolve(domain, record_type, lifetime=3.0)
+        return tuple(r.to_text() for r in answers)
+    except (dns.exception.DNSException, OSError, ValueError):
+        return ()
+
+
+def safe_dns_query(domain: str, record_type: str):
+    """Return DNS answers or None without raising for invalid/unresolvable domains."""
+    normalized = _normalized_dns_domain(domain)
+    record_type = record_type.upper()
+    if normalized is None or record_type not in {"A", "MX", "CNAME", "TXT"}:
         return None
+    records = _cached_dns_query(normalized, record_type, int(monotonic() // 300))
+    return list(records) if records else None
 
 def extract_dns_records(domain: str):
 
@@ -986,33 +1016,16 @@ def get_file_extension(file):
     _, ext = os.path.splitext(file)
     return ext.lower()
 
-# (path, mtime_ns, ext) -> parsed message object
-_PARSED_MSG_CACHE: Dict[Tuple[str, int, str], Any] = {}
-
 def parse_detected_filetype(ext: str, file_path: Union[str, Path]):
     ext = (ext or "").lower()
     if ext and not ext.startswith("."):
         ext = "." + ext
 
     file_path = str(file_path)
-
-    try:
-        mtime_ns = os.stat(file_path).st_mtime_ns
-    except OSError:
-        # If we can't stat it, just parse normally (no caching).
-        return parse_full_eml(file_path) if ext == ".eml" else parse_headers_from_file(file_path)
-
-    key = (file_path, mtime_ns, ext)
-    cached = _PARSED_MSG_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    parsed = parse_full_eml(file_path) if ext == ".eml" else parse_headers_from_file(file_path)
-    _PARSED_MSG_CACHE[key] = parsed
-    return parsed
+    return parse_full_eml(file_path) if ext == ".eml" else parse_headers_from_file(file_path)
 
 def get_email_body(file_path):
-    # Parse once (cached) and then extract bodies
+    # Parse the requested message and extract its bodies without retaining it.
     msg = _get_cached_parsed_message(file_path)
     plain_body, html_body = extract_bodies(msg)
 
@@ -1106,8 +1119,7 @@ DATA_PDF_RE = re.compile(
 def _get_html_body(msg) -> str:
     for part in msg.walk():
         if part.get_content_type() == "text/html":
-            b = part.get_payload(decode=True) or b""
-            return b.decode("utf-8", errors="ignore")
+            return _read_text_part(part)
     return ""
 
 def _looks_like_pdf_url(url: str) -> bool:
@@ -1149,6 +1161,8 @@ def _extract_virtual_attachments_from_html(html: str):
 
     # 1) Embedded PDFs (data URI)
     for b64 in DATA_PDF_RE.findall(html):
+        if len(b64) > (MAX_DEEP_SCAN_BYTES * 4 // 3) + 16:
+            continue
         cleaned = re.sub(r"\s+", "", b64)
         try:
             pdf_bytes = base64.b64decode(cleaned, validate=False)
@@ -1439,15 +1453,6 @@ def _svg_script_obfuscation_findings(svg_text_lower: str) -> List[Finding]:
 def analyze_pdf_bytes(data: bytes) -> list[Finding]:
     findings: list[Finding] = []
     
-    # try:
-    #     from pypdf import PdfReader
-    # except Exception:
-    #     findings.append(Finding(
-    #         "pdf_parser_missing", 0,
-    #         "PDF deep inspection not available because 'pypdf' is not installed."
-    #     ))
-    #     return findings
-
     # Quick raw scan (cheap, catches many malicious PDFs even if parsing fails)
     raw_head = data[:500_000].lower()
     if b"/javascript" in raw_head or b"/js" in raw_head:
@@ -1458,7 +1463,18 @@ def analyze_pdf_bytes(data: bytes) -> list[Finding]:
         findings.append(Finding("pdf_auto_action_raw", 45,
                                 "PDF contains auto-action markers (OpenAction/AA) that can trigger behavior on open."))
 
-    # Deep parse
+    # Deep parse is optional: missing pypdf is a scanner configuration issue,
+    # not evidence that the attachment itself is suspicious.
+    if PdfReader is None:
+        findings.append(Finding("pdf_parser_unavailable", 0,
+                                "PDF deep inspection unavailable: install the pypdf dependency."))
+        return findings
+
+    if len(data) > MAX_DEEP_SCAN_BYTES:
+        findings.append(Finding("pdf_deep_scan_skipped", 0,
+                                "PDF exceeds the deep-inspection size limit."))
+        return findings
+
     try:
         reader = PdfReader(io.BytesIO(data), strict=False)
     except Exception as e:
@@ -1477,10 +1493,16 @@ def analyze_pdf_bytes(data: bytes) -> list[Finding]:
     except Exception:
         root = None
 
+    visited_objects: set[int] = set()
+
     def walk_obj(obj, depth=0):
-        # Very conservative recursion guard
-        if depth > 20:
+        # Limit cyclic references, recursion depth, and total traversal work.
+        if depth > 20 or len(visited_objects) >= 2000:
             return
+        obj_id = id(obj)
+        if obj_id in visited_objects:
+            return
+        visited_objects.add(obj_id)
         try:
             # pypdf objects often behave like dicts
             if hasattr(obj, "keys"):
@@ -1584,10 +1606,16 @@ def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
                                     evidence=f"declared={declared_mime}"))
 
     # 4) ZIP inspection (covers OOXML + zipped droppers)
-    if magic == "zip":
+    if magic == "zip" and len(data) <= MAX_DEEP_SCAN_BYTES:
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as z:
-                names = [n.lower() for n in z.namelist()]
+                names = []
+                for idx, member in enumerate(z.infolist()):
+                    if idx >= 2000:
+                        findings.append(Finding("zip_scan_limited", 0,
+                                                "ZIP contains more entries than the inspection limit."))
+                        break
+                    names.append(member.filename.lower())
 
                 # Macro in OOXML
                 if any("vbaproject.bin" in n for n in names):
@@ -1601,7 +1629,7 @@ def analyze_attachment_bytes(filename: str, declared_mime: str, data: bytes,
                                             "Archive contains potentially executable/script files.",
                                             evidence=", ".join(dangerous_members[:10])))
 
-        except zipfile.BadZipFile:
+        except (zipfile.BadZipFile, OSError, ValueError, RuntimeError):
             findings.append(Finding("zip_parse_fail", 15, "File claims to be a ZIP but could not be parsed (corrupt/obfuscated)."))
 
     # 5) HTML heuristics (treat HTML as a container)
@@ -2002,8 +2030,10 @@ def run_analysis(file_path: str,
     # Load message for later
     message, raw = load_email(file_path)
 
-    # Get file extension
+    # Get file extension. The BytesParser result is reused for all EML header,
+    # body, attachment, and authentication checks during this analysis.
     ext = get_file_extension(file_path)
+    msg = message if ext == ".eml" else parse_headers_from_file(file_path)
 
     if ext == '.eml':
         print(BRIGHT_GREEN + "[+] Detected EML file" + RESET)
@@ -2034,10 +2064,21 @@ def run_analysis(file_path: str,
         else:
             print(YELLOW + '[*] Could not find any attachments' + RESET)
 
+    # A virtual PDF link is a URL artifact, not downloadable attachment bytes.
+    # Only feed actual file payloads into hashing, deep inspection, and YARA.
+    scannable_attachments = [
+        att for att in attachments
+        if isinstance(att.get("payload"), bytes) and bool(att["payload"])
+    ]
     if attachments:
             print(BRIGHT_GREEN + "[+] Email attachments detected" + RESET)
             for attachment in attachments:
                 print(BRIGHT_WHITE + "-----------------------------------------------" + RESET)
+
+                if not isinstance(attachment.get("payload"), bytes) or not attachment["payload"]:
+                    print(f"\nAttachment reference: {attachment['filename']}")
+                    print("No attachment bytes available; scanning the linked URL instead.")
+                    continue
 
                 if show_spinners:
                     analyzeSpinner = Halo(text="Analyzing attachment...", spinner="dots")
@@ -2052,6 +2093,21 @@ def run_analysis(file_path: str,
 
                 if show_spinners:
                     analyzeSpinner.stop()
+
+                # Structured findings are also needed by JSON and PDF reporters.
+                for finding in findings:
+                    analysis_results.append({
+                        "category": Category.CONTENT.value,
+                        "code": finding.code,
+                        "severity": (Severity.HIGH if finding.weight >= 40
+                                     else Severity.MEDIUM if finding.weight >= 20
+                                     else Severity.LOW if finding.weight > 0
+                                     else Severity.INFO).value,
+                        "message": finding.message,
+                        "data": {"filename": attachment["filename"],
+                                 "weight": finding.weight,
+                                 "evidence": finding.evidence},
+                    })
 
                 print(f"\nAttachment: {attachment['filename']}")
                 print(f"Declared MIME: {attachment['content_type']}")
@@ -2071,7 +2127,8 @@ def run_analysis(file_path: str,
                     print(f"  - (+{f.weight}) {f.message}")
                     if f.evidence:
                         print(f"      evidence: {f.evidence}")
-                print(BRIGHT_YELLOW + f"{len(findings) - 10} additional findings omitted from output" + RESET)
+                if len(findings) > 10:
+                    print(BRIGHT_YELLOW + f"{len(findings) - 10} additional findings omitted from output" + RESET)
                 print()
                 print(YELLOW + f"Risk Score: {score}/100" + RESET)
                 print()
@@ -2091,29 +2148,29 @@ def run_analysis(file_path: str,
     # Pull Headers from Headers Block
     # ----------------------------------------------------------
 
-    x_mailer_hdr = get_header(file_path, "X-Mailer")
-    user_agent_hdr = get_header(file_path, "User-Agent")
+    x_mailer_hdr = msg.get("X-Mailer")
+    user_agent_hdr = msg.get("User-Agent")
     mailer_value = x_mailer_hdr or user_agent_hdr
 
     #received_from_hdr = msg.get_all("Received") or []
-    received_from_hdr = get_headers(file_path, "Received")
+    received_from_hdr = (msg.get_all("Received") or [])
 
-    from_hdr = get_header(file_path, "From")
-    to_hdr = get_header(file_path, "To")
-    reply_to_hdr = get_header(file_path, "Reply-To")
-    return_path_hdr = get_header(file_path, "Return-Path")
-    date_hdr = get_header(file_path, "Date")
-    subject_hdr = get_header(file_path, "Subject")
-    mime_version_hdr = get_header(file_path, "MIME-Version")
-    content_language_hdr = get_header(file_path, "Content-Language")
-    content_type_hdr = get_header(file_path, "Content-Type")
-    content_transfer_encode_hdr = get_header(file_path, "Content-Transfer-Encoding")
-    thread_topic_hdr = get_header(file_path, "Thread-Topic")
-    org_authAs_hdr = get_header(file_path, "X-MS-Exchange-Organization-AuthAs")
-    has_attachment_hdr = get_header(file_path, "X-MS-Has-Attach")
-    origin_IP_hdr = get_header(file_path, "X-Originating-IP")
+    from_hdr = msg.get("From")
+    to_hdr = msg.get("To")
+    reply_to_hdr = msg.get("Reply-To")
+    return_path_hdr = msg.get("Return-Path")
+    date_hdr = msg.get("Date")
+    subject_hdr = msg.get("Subject")
+    mime_version_hdr = msg.get("MIME-Version")
+    content_language_hdr = msg.get("Content-Language")
+    content_type_hdr = msg.get("Content-Type")
+    content_transfer_encode_hdr = msg.get("Content-Transfer-Encoding")
+    thread_topic_hdr = msg.get("Thread-Topic")
+    org_authAs_hdr = msg.get("X-MS-Exchange-Organization-AuthAs")
+    has_attachment_hdr = msg.get("X-MS-Has-Attach")
+    origin_IP_hdr = msg.get("X-Originating-IP")
 
-    auth_results_headers = get_headers(file_path,"authentication-results")
+    auth_results_headers = (msg.get_all("authentication-results") or [])
     has_auth_headers = bool(auth_results_headers)
     auth_spf = auth_dkim = auth_dmarc = None
 
@@ -2141,14 +2198,18 @@ def run_analysis(file_path: str,
     # END - Check for Mailer or User-Agent Headers
     # ----------------------------------------------------------
 
-    # Check for file type .eml, .txt and parse message
-    msg = parse_detected_filetype(ext, file_path)
+    # The message was already parsed above.
 
     # Extract Email Body
     plain_body, html_body = extract_bodies(msg)
 
     # Extract URLs
     found_URLS = extract_urls_from_body(plain_body, html_body)
+    for attachment in attachments:
+        if attachment.get("virtual_kind") == "pdf_link":
+            linked_url = normalize_url(attachment.get("url", ""))
+            if linked_url and linked_url not in found_URLS:
+                found_URLS.append(linked_url)
     url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
 
     if plain_body:
@@ -2236,7 +2297,7 @@ def run_analysis(file_path: str,
 
 
     # Parse received-spf
-    received_spf_hdrs = get_headers(file_path,"received-spf")
+    received_spf_hdrs = (msg.get_all("received-spf") or [])
     # Set "has SPF Headers" flag
     hasSPFHeaders = bool(received_spf_hdrs)
 
@@ -2247,14 +2308,20 @@ def run_analysis(file_path: str,
 
     if received_spf_hdrs:
         primary_spf_header = received_spf_hdrs[0]
-        parsed_spf_hdr = parse_received_spf(primary_spf_header) or None
+        parsed_spf_hdr = parse_received_spf(primary_spf_header)
+
+    spf_result = parsed_spf_hdr.get("result") if parsed_spf_hdr else None
+    spf_client_ip = parsed_spf_hdr.get("client_ip") if parsed_spf_hdr else None
+    if spf_result:
         add_finding(
                 analysis_results,
                 category=Category.SPF,
                 code=Code.SPF_STATUS,
-                severity=Severity.INFO if "pass" in parsed_spf_hdr['result'] else Severity.HIGH,
-                message=f"SPF status: {parsed_spf_hdr['result']}",
-                status=parsed_spf_hdr['result'],
+                severity=(Severity.INFO if spf_result == "pass" else
+                          Severity.HIGH if spf_result in {"fail", "softfail"} else
+                          Severity.LOW),
+                message=f"SPF status: {spf_result}",
+                status=spf_result,
             )
 
     # Check for CrossTenant Headers
@@ -2286,9 +2353,9 @@ def run_analysis(file_path: str,
     if content_transfer_encode_hdr:
         print(f"Content Transfer Encoding: {content_transfer_encode_hdr!r}")
     print()
-    if hasSPFHeaders and parsed_spf_hdr['result'] == 'pass':
+    if spf_result == 'pass':
         print(f"{BRIGHT_GREEN}received-spf:{RESET}   {received_spf_hdrs[0]!r}")
-    if hasSPFHeaders and parsed_spf_hdr['result'] == 'fail':
+    if spf_result == 'fail':
         print(f"{BRIGHT_RED}received-spf:{RESET}   {received_spf_hdrs[0]!r}")
     print()
     print(f"MIME-Version:   {mime_version_hdr!r}")
@@ -2350,11 +2417,17 @@ def run_analysis(file_path: str,
 
     WHITELIST_PATH = BASE_DIR / 'config' / 'domain-whitelist.txt'
 
-    # Load up DNS whitelist for domains to skip WHOIS checks for: yourcompanydomain.com, etc.
-    with open(WHITELIST_PATH, 'r') as f:
-        lines = f.read().splitlines()
+    # The whitelist is optional and can be absent in a fresh Docker volume.
+    try:
+        with open(WHITELIST_PATH, 'r', encoding='utf-8') as f:
+            lines = {line.strip().lower() for line in f if line.strip() and not line.lstrip().startswith('#')}
+    except OSError:
+        lines = set()
 
-    if from_domain in lines:
+    if not _normalized_dns_domain(from_domain):
+        print(YELLOW + "[*] No valid sender domain; skipping WHOIS and DNS lookups" + RESET)
+        print()
+    elif from_domain.lower() in lines:
         print(YELLOW + "[*] Domain is in whitelist, skipping unneccesary WHOIS & DNS Records lookup" + RESET)
         print()
     else:
@@ -2373,18 +2446,18 @@ def run_analysis(file_path: str,
             whoisSpinner.stop()
 
         if whois_data:
-            print(f"Domain:                 {whois_data['domain']}")
-            print(f"Domain Registrar:       {whois_data['registrar']}")
-            print(f"Domain Age:             {whois_data['domain_age_days']}")
-            if whois_data['domain_age_days'] <= 180:
+            print(f"Domain:                 {whois_data.get('domain', from_domain)}")
+            print(f"Domain Registrar:       {whois_data.get('registrar')}")
+            print(f"Domain Age:             {whois_data.get('domain_age_days')}")
+            if isinstance(whois_data.get('domain_age_days'), (int, float)) and whois_data['domain_age_days'] <= 180:
                 print(RED + '[-] Domain is newly registered' + RESET)
-            if whois_data['domain_age_days'] <= 365 and whois_data['domain_age_days'] > 180:
+            if isinstance(whois_data.get('domain_age_days'), (int, float)) and 180 < whois_data['domain_age_days'] <= 365:
                 print(YELLOW + '[*] Domain is young' + RESET)
-            print(f"Creation Date:          {whois_data['creation_date']}")
-            print(f"Expiration Date:        {whois_data['expiration_date']}")
-            print(f"Updated Date:           {whois_data['updated_date']}")
+            print(f"Creation Date:          {whois_data.get('creation_date')}")
+            print(f"Expiration Date:        {whois_data.get('expiration_date')}")
+            print(f"Updated Date:           {whois_data.get('updated_date')}")
             print()
-            print(f"Nameserver:             {whois_data['name_servers']}")
+            print(f"Nameserver:             {whois_data.get('name_servers')}")
         else:
             print(YELLOW + "[*] Could not lookup WHOIS information" + RESET)
 
@@ -2435,11 +2508,11 @@ def run_analysis(file_path: str,
             )
 
     if from_domain == to_domain and hasSPFHeaders:
-        if parsed_spf_hdr['result'] == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
+        if spf_result == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
             print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
-            if parsed_spf_hdr['result'] == "fail" or auth_spf == 'fail':
+            if spf_result == "fail" or auth_spf == 'fail':
                 attack_finding_codes.append(f"SPF_FAIL")
-                print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']} for domain -> {from_domain}")
+                print(f"SPF Failed -> Origin IP = {spf_client_ip} for domain -> {from_domain}")
             if org_authAs_hdr == "Anonymous":
                 print(f"AuthAs -> {org_authAs_hdr}")
             if auth_dmarc == 'fail':
@@ -2448,9 +2521,9 @@ def run_analysis(file_path: str,
             print()
 
     if from_domain != to_domain:
-        if parsed_spf_hdr["result"] == "fail" or auth_spf == 'fail':
+        if spf_result == "fail" or auth_spf == 'fail':
             print(f"{RED}=== External Spoofing evidence found ==={RESET}")
-            print(f"SPF Failed -> Origin IP = {parsed_spf_hdr['client_ip']}")
+            print(f"SPF Failed -> Origin IP = {spf_client_ip}")
         print()
 
     # Print if no From Headers are found
@@ -2518,9 +2591,9 @@ def run_analysis(file_path: str,
             from_domain=from_domain,
             reply_domain=reply_to_domain,
             return_domain=return_path_domain,
-            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
+            client_ip=spf_client_ip,
             urls=found_URLS if found_URLS else [],
-            attachments=attachments if attachments else [],
+            attachments=scannable_attachments,
         )
 
         print_correlation_results(ti_matches, {
@@ -2545,32 +2618,10 @@ def run_analysis(file_path: str,
             from_domain=from_domain,
             reply_domain=reply_to_domain,
             return_domain=return_path_domain,
-            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
+            client_ip=spf_client_ip,
             urls=found_URLS if found_URLS else [],
-            attachments=attachments if attachments else [],
-            mailer=get_header(file_path, "X-Mailer") or get_header(file_path, "User-Agent"),
-        )
-
-        # ----------------------------------------------------------
-        # Save IOCs to local threat intel database
-        # ----------------------------------------------------------
-
-        analysis_id = save_analysis(
-            file_name=file_path,
-            risk_score=None,   # swap in your computed score when you build the global scorer
-            se_score=se_result.score if 'se_result' in dir() else None,
-            verdict=None,      # same — wire in when you have it
-        )
-
-        extract_and_save_iocs(
-            analysis_id=analysis_id,
-            from_domain=from_domain,
-            reply_domain=reply_to_domain,
-            return_domain=return_path_domain,
-            client_ip=parsed_spf_hdr["client_ip"] if parsed_spf_hdr else None,
-            urls=found_URLS if found_URLS else [],
-            attachments=attachments if attachments else [],
-            mailer=get_header(file_path, "X-Mailer") or get_header(file_path, "User-Agent"),
+            attachments=scannable_attachments,
+            mailer=msg.get("X-Mailer") or msg.get("User-Agent"),
         )
 
     # ----------------------------------------------------------
@@ -2579,7 +2630,7 @@ def run_analysis(file_path: str,
     yara_matches = scan_email_components(
         plain_body=plain_body,
         html_body=html_body,
-        attachments=attachments if attachments else [],
+        attachments=scannable_attachments,
     )
 
     print(format_yara_output(yara_matches, {
@@ -2621,16 +2672,22 @@ def run_analysis(file_path: str,
 ==================================================
 {RESET}
 """)
+    return analysis_results
 
 def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
     analysis_results = []  # your existing findings list
 
-    email_body = get_email_body(file_path)
+    # Read the message once for PDF metadata rather than reparsing it separately
+    # for its body and Received headers.
+    pdf_msg = parse_detected_filetype(get_file_extension(file_path), file_path)
+    plain_body, html_body = extract_bodies(pdf_msg)
+    email_body = html_body or plain_body
 
     # ... run your usual logic to fill analysis_results and capture text_output ...
-    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False, show_mime=show_mime)
+    text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False,
+                                            show_mime=show_mime, findings_out=analysis_results)
 
-    hops = parse_received_hops(get_headers(file_path, "Received"))
+    hops = parse_received_hops(pdf_msg.get_all("Received") or [])
 
     # Example badge: mark the last hop as "Delivered"
     if hops:
@@ -2657,7 +2714,8 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
 def run_analysis_capture_text(file_path: str,
                               use_json: bool = False,
                               strip_ansi: bool = True,
-                              show_mime: bool = False) -> str:
+                              show_mime: bool = False,
+                              findings_out: list[dict[str, Any]] | None = None) -> str:
     """
     Run the analysis and capture the full terminal-style output
     as a single string, instead of printing it to the real terminal.
@@ -2665,7 +2723,9 @@ def run_analysis_capture_text(file_path: str,
     buffer = io.StringIO()
     # Redirect stdout into our buffer while run_analysis executes
     with contextlib.redirect_stdout(buffer):
-        run_analysis(file_path, use_json=use_json, show_spinners=False, show_mime=show_mime)
+        findings = run_analysis(file_path, use_json=use_json, show_spinners=False, show_mime=show_mime)
+    if findings_out is not None:
+        findings_out.extend(findings)
 
     # Get everything that was printed
     output = buffer.getvalue()
@@ -2675,17 +2735,35 @@ def run_analysis_capture_text(file_path: str,
 
     return output
 
-def analyze_sender_rdap(domain: str, analysis_results):
-    rdap = lookup_rdap(domain)
+@lru_cache(maxsize=128)
+def _cached_rdap_lookup(domain: str, time_bucket: int) -> dict:
+    # Domain metadata is cached briefly; actual network timeouts are controlled
+    # by rdapHelper.lookup_rdap and must be verified in that module.
+    try:
+        return lookup_rdap(domain)
+    except Exception as exc:
+        # Cache transient failures too, avoiding repeated lookups for the same host.
+        return {"success": False, "error": str(exc)}
 
-    if not rdap["success"]:
+
+def analyze_sender_rdap(domain: str, analysis_results):
+    normalized = _normalized_dns_domain(domain)
+    if normalized is None:
+        return None
+
+    try:
+        rdap = _cached_rdap_lookup(normalized, int(monotonic() // 300))
+    except Exception as exc:
+        rdap = {"success": False, "error": str(exc)}
+
+    if not isinstance(rdap, dict) or not rdap.get("success"):
         add_finding(
             analysis_results,
             category=Category.METADATA,
             code=Code.WHOIS_LOOKUP_FAILED,
             severity=Severity.LOW,
-            message=f"WHOIS lookup failed for domain {domain}",
-            error=rdap["error"],
+            message=f"WHOIS lookup failed for domain {normalized}",
+            error=rdap.get("error") if isinstance(rdap, dict) else "Invalid RDAP response",
         )
         return None
 
@@ -2694,10 +2772,10 @@ def analyze_sender_rdap(domain: str, analysis_results):
         category=Category.METADATA,
         code=Code.WHOIS_BASIC_INFO,
         severity=Severity.INFO,
-        message=f"WHOIS data for {domain}",
-        registrar=rdap["registrar"],
-        creation_date=rdap["creation_date"],
-        expiration_date=rdap["expiration_date"],
+        message=f"WHOIS data for {normalized}",
+        registrar=rdap.get("registrar"),
+        creation_date=rdap.get("creation_date"),
+        expiration_date=rdap.get("expiration_date"),
     )
 
     return rdap
