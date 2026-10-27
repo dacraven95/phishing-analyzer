@@ -1,6 +1,6 @@
 [project]
 name = "phish-analyzer"
-version = "0.6.1"
+version = "0.6.2"
 description = "Email phishing analysis tool"
 authors = [
     { name="DC", email="dacraven95@gmail.com" }
@@ -19,6 +19,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "pypdf>=4.0.0",
     "yara-python>=4.3.0",
+    "fastmcp>=4,<5",
 ]
 
 [build-system]

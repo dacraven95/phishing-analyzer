@@ -19,7 +19,19 @@ from starlette.background import BackgroundTask
 from phish_analyzer.core import run_analysis_and_pdf, run_analysis_structured
 
 logger = logging.getLogger(__name__)
-app = FastAPI()
+# MCP is opt-in and protected by independent bearer-token authentication.
+# A mounted ASGI app does not inherit FastAPI's /analyze dependencies.
+mcp_token = os.getenv("MCP_API_TOKEN", "")
+if mcp_token:
+    from phish_analyzer.mcp_server import create_mcp_server
+
+    mcp_server = create_mcp_server(mcp_token)
+    mcp_app = mcp_server.http_app(path="/")
+    app = FastAPI(lifespan=mcp_app.lifespan)
+    app.mount("/mcp", mcp_app)
+else:
+    app = FastAPI()
+
 
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
