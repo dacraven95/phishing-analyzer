@@ -1,4 +1,4 @@
-# 🛡️ Phishing Analyzer v0.6.0
+# 🛡️ Phishing Analyzer v0.6.1
 
 **Email phishing analysis for security analysts, IT administrators, and incident responders.**
 

@@ -93,29 +93,35 @@ def generate_pdf_report(
             # Each report gets a private renderer scratch directory. Reusing
             # ./reports/email_render.png would cause concurrent PDF data races.
             with tempfile.TemporaryDirectory(prefix="phish-render-") as render_dir:
-                html_png_path = render_html_to_png(
-                    email_body,
-                    output_png_path=str(Path(render_dir) / "email_render.png"),
-                    viewport_width=900,
-                    viewport_height=1200,
-                    full_page=True,
-                )
-
-                # Space before email render block
-                y -= 0.5 * inch
-
-                min_readable_img_h = 4.25 * inch
-
-                y = _ensure_space(c, y, min_readable_img_h, height, margins)
-
-                y = _draw_email_html_screenshot(
-                    c,
-                    png_path=html_png_path,
-                    width=width,
-                    height=height,
-                    margins=margins,
-                    start_y=y
-                )
+                try:
+                    html_png_path = render_html_to_png(
+                        email_body,
+                        output_png_path=str(Path(render_dir) / "email_render.png"),
+                        viewport_width=900,
+                        viewport_height=1200,
+                        full_page=True,
+                    )
+                    y -= 0.5 * inch
+                    min_readable_img_h = 4.25 * inch
+                    y = _ensure_space(c, y, min_readable_img_h, height, margins)
+                    y = _draw_email_html_screenshot(
+                        c,
+                        png_path=html_png_path,
+                        width=width,
+                        height=height,
+                        margins=margins,
+                        start_y=y,
+                    )
+                except Exception:
+                    # HTML preview is optional. If Chromium cannot launch securely,
+                    # times out, or produces an invalid image, preserve the report.
+                    # The email text and the full analysis still appear below.
+                    y = _ensure_space(c, y, 0.4 * inch, height, margins)
+                    c.setFillColor(colors.HexColor("#596974"))
+                    c.setFont("Helvetica-Oblique", 9)
+                    c.drawString(margins["left"], y,
+                                 "HTML visual preview unavailable; email content follows as text.")
+                    y -= 0.3 * inch
 
 
         # Space before email body block
