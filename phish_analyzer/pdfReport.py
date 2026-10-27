@@ -59,11 +59,21 @@ def generate_pdf_report(
         "bottom": 0.75 * inch,
     }
 
-    # Draw header and summary
+    # The dashboard already carries the file, time, verdict, and key evidence.
+    # Start the detailed report directly after a compact section heading instead
+    # of repeating the metadata and severity summary on the following page.
+    # Preserve the original header/summary for legacy callers without risk data.
+    assessment = metadata.get("risk_assessment")
+    has_dashboard = isinstance(assessment, dict) and "score" in assessment
     y = height - margins["top"]
-    y = _draw_header(c, width, margins, y, metadata)
-    y -= 0.25 * inch
-    y = _draw_summary_box(c, width, margins, y, analysis_results, metadata)
+    if has_dashboard:
+        _draw_risk_dashboard(c, width, height, margins, metadata, assessment)
+        c.showPage()
+        y = _draw_technical_header(c, width, margins, y)
+    else:
+        y = _draw_header(c, width, margins, y, metadata)
+        y -= 0.25 * inch
+        y = _draw_summary_box(c, width, margins, y, analysis_results, metadata)
 
     received_hops = (metadata or {}).get("received_hops") or []
     # Reverse list so we have "first -> last" hops
@@ -72,7 +82,7 @@ def generate_pdf_report(
 
     html_png_path = None
 
-    email_body = metadata["email_body"] or None
+    email_body = metadata.get("email_body") or None
 
     # Draw email body block
     if email_body:
@@ -129,6 +139,169 @@ def generate_pdf_report(
     )
 
     c.save()
+
+
+def _draw_technical_header(
+    c: canvas.Canvas,
+    width: float,
+    margins: Dict[str, float],
+    y: float,
+) -> float:
+    """Start the details section without duplicating first-page metadata."""
+    c.setFillColor(colors.HexColor("#172A35"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(margins["left"], y, "Technical details")
+    y -= 0.18 * inch
+    c.setStrokeColor(colors.HexColor("#E8EEF0"))
+    c.setLineWidth(0.7)
+    c.line(margins["left"], y, width - margins["right"], y)
+    return y - 0.16 * inch
+
+
+# ------------ Unified risk overview ------------
+
+
+def _dashboard_color(score: int):
+    if score >= 75:
+        return colors.HexColor("#B42332")
+    if score >= 50:
+        return colors.HexColor("#C24535")
+    if score >= 25:
+        return colors.HexColor("#AA6B18")
+    return colors.HexColor("#147D62")
+
+
+def _fit_label(text: str, width: float, font: str, size: float) -> str:
+    """Truncate untrusted long content rather than overflow the report page."""
+    text = " ".join(str(text).split()).encode("latin-1", "replace").decode("latin-1")
+    if pdfmetrics.stringWidth(text, font, size) <= width:
+        return text
+    while text and pdfmetrics.stringWidth(text + "...", font, size) > width:
+        text = text[:-1]
+    return text.rstrip() + "..."
+
+
+def _draw_risk_dashboard(
+    c: canvas.Canvas, width: float, height: float, margins: Dict[str, float],
+    metadata: Dict[str, Any], risk: Dict[str, Any],
+) -> None:
+    """Visually stable first page backed by the same score as CLI/SQLite/JSON."""
+    left, right = margins["left"], width - margins["right"]
+    content_w = right - left
+    score = max(0, min(100, int(risk.get("score", 0))))
+    verdict = str(risk.get("verdict") or "UNDETERMINED").upper()
+    accent = _dashboard_color(score)
+    ink = colors.HexColor("#172A35")
+    muted = colors.HexColor("#596974")
+    light = colors.HexColor("#E8EEF0")
+    teal = colors.HexColor("#127D70")
+    y = height - margins["top"]
+
+    c.setFont("Helvetica-Bold", 10)
+    c.setFillColor(teal)
+    c.drawString(left, y, "PHISH ANALYZER")
+    c.setFont("Helvetica-Bold", 24)
+    c.setFillColor(ink)
+    y -= 33
+    # c.drawString(left, y, "Unified risk assessment")
+    # y -= 23
+    c.drawString(margins["left"], y, f"Phish Analyzer Report v{get_version()}")
+    y -= 23
+    c.setFont("Helvetica", 9)
+    c.setFillColor(muted)
+    c.drawString(left, y, _fit_label(
+        f"File: {Path(str(metadata.get('file_name', 'Unknown'))).name}", content_w, "Helvetica", 9))
+    y -= 15
+    stamp = metadata.get("analyzed_at")
+    when = stamp.strftime("%Y-%m-%d %H:%M") if isinstance(stamp, datetime) else str(stamp or "")
+    c.drawString(left, y, f"Analyzed: {when}   |   Method: {risk.get('method', 'heuristic')}")
+    y -= 19
+
+    # Main score panel
+    card_h = 114
+    c.setFillColor(colors.HexColor("#F3F8F7"))
+    c.setStrokeColor(colors.HexColor("#DFEAE7"))
+    c.roundRect(left, y-card_h, content_w, card_h, 10, fill=1, stroke=1)
+    c.setFillColor(ink)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(left + 20, y - 26, "OVERALL RISK")
+    c.setFillColor(accent)
+    c.setFont("Helvetica-Bold", 34)
+    c.drawString(left + 20, y - 71, str(score))
+    c.setFont("Helvetica", 13)
+    c.setFillColor(muted)
+    c.drawString(left + 68, y - 68, "/ 100")
+    c.setFont("Helvetica-Bold", 13)
+    c.setFillColor(accent)
+    c.drawRightString(right - 21, y - 43, verdict)
+    c.setFillColor(muted)
+    c.setFont("Helvetica", 9)
+    c.drawRightString(right - 21, y - 61, "Heuristic assessment")
+    c.setFillColor(light)
+    c.roundRect(left + 20, y - 98, content_w - 40, 8, 4, stroke=0, fill=1)
+    if score:
+        c.setFillColor(accent)
+        c.roundRect(left + 20, y - 98, (content_w - 40)*score/100, 8, 4, stroke=0, fill=1)
+    y -= card_h + 26
+
+    c.setFillColor(ink)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(left, y, "Detection breakdown")
+    y -= 22
+    components = risk.get("components") or []
+    for component in components[:5]:
+        label = _fit_label(component.get("label", "Unknown"), 170, "Helvetica", 10)
+        points = max(0, min(100, int(component.get("score", 0))))
+        c.setFont("Helvetica", 10)
+        c.setFillColor(ink)
+        c.drawString(left, y, label)
+        bar_x = left + 188
+        bar_w = content_w - 232
+        c.setFillColor(light)
+        c.roundRect(bar_x, y-2, bar_w, 9, 4, stroke=0, fill=1)
+        if points:
+            c.setFillColor(_dashboard_color(points))
+            c.roundRect(bar_x, y-2, bar_w*points/100, 9, 4, stroke=0, fill=1)
+        c.setFont("Helvetica-Bold", 9)
+        c.setFillColor(ink)
+        c.drawRightString(right, y, f"{points}/100")
+        y -= 29
+    y -= 7
+
+    c.setFillColor(ink)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(left, y, "Key evidence")
+    y -= 19
+    evidence = risk.get("key_findings") or []
+    if not evidence:
+        evidence = ["No high-confidence suspicious indicators were recorded."]
+    for item in evidence[:4]:
+        c.setFillColor(accent)
+        c.circle(left + 4, y + 3, 3, fill=1, stroke=0)
+        c.setFont("Helvetica", 9)
+        c.setFillColor(ink)
+        c.drawString(left + 16, y, _fit_label(item, content_w - 20, "Helvetica", 9))
+        y -= 20
+    y -= 10
+
+    warnings = risk.get("limitations") or []
+    if warnings:
+        c.setFillColor(ink)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(left, y, "Assessment limitations")
+        y -= 15
+        for warning in warnings[:2]:
+            c.setFillColor(muted)
+            c.setFont("Helvetica", 8)
+            c.drawString(left, y, _fit_label(warning, content_w, "Helvetica", 8))
+            y -= 12
+    # Static guidance near footer; never conflate a low score with verified safety.
+    c.setStrokeColor(light)
+    c.line(left, margins["bottom"] + 27, right, margins["bottom"] + 27)
+    c.setFillColor(muted)
+    c.setFont("Helvetica", 8)
+    c.drawString(left, margins["bottom"] + 13,
+                 "Scores are investigative heuristics, not probabilities or definitive safety verdicts.")
 
 
 # ------------ Internal helpers ------------
@@ -562,8 +735,8 @@ def _draw_header(
     # Title
     c.setFont("Helvetica-Bold", 20)
     c.setFillColor(colors.black)
-    c.drawString(margins["left"], y, f"Phish Analyzer Report v{get_version()}")
-    y -= 0.3 * inch
+    # c.drawString(margins["left"], y, f"Phish Analyzer Report v{get_version()}")
+    # y -= 0.3 * inch
 
     # Meta line 1
     c.setFont("Helvetica", 10)

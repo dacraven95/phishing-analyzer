@@ -24,6 +24,7 @@ from email.utils import parseaddr
 from email.message import Message
 from email.parser import BytesParser
 from html.parser import HTMLParser
+from html import unescape
 from urllib.parse import urlparse, urlunparse, parse_qs, unquote
 from enum import Enum
 from datetime import datetime
@@ -123,12 +124,21 @@ class Code(str, Enum):
     URL_BRAND_IMPERSONATION = "URL_BRAND_IMPERSONATION"
     URL_OBFUSCATED_PATH = "URL_OBFUSCATED_PATH"
     URL_SUSPICIOUS_PATH = "URL_SUSPICIOUS_PATH"
+    URL_USERINFO = "URL_USERINFO"
+    URL_UNUSUAL_PORT = "URL_UNUSUAL_PORT"
+    URL_SHORTENER = "URL_SHORTENER"
+    URL_EXTERNAL_REDIRECT = "URL_EXTERNAL_REDIRECT"
+    URL_LINK_TEXT_MISMATCH = "URL_LINK_TEXT_MISMATCH"
+    URL_MIXED_SCRIPT = "URL_MIXED_SCRIPT"
 
     # Headers
     CROSSTENANT_PRESENT = "CROSSTENANT_PRESENT"
     FROM_REPLYTO_MISMATCH = "FROM_REPLYTO_MISMATCH"
     FROM_RETURNPATH_MISMATCH = "FROM_RETURNPATH_MISMATCH"
     MISSING_HEADER = "MISSING_HEADER"
+    AUTH_UNVERIFIED = "AUTH_UNVERIFIED"
+    AUTH_TRUSTED = "AUTH_TRUSTED"
+    SENDER_REPLYTO_MISMATCH = "SENDER_REPLYTO_MISMATCH"
 
     # Domain Related
     WHOIS_BASIC_INFO = "WHOIS_BASIC_INFO"
@@ -355,14 +365,31 @@ def detect_cyrillic_homoglyph_domain(domain: str) -> List["Finding"]:
 
     return findings
 
-# optional: known-good company domains (can expand later)
+# Recognized corporate roots are exact host suffixes, not approval of actual URL safety.
+# No network requests are made to any untrusted links during URL analysis.
 TRUSTED_BRAND_DOMAINS = {
     "paypal": {"paypal.com"},
-    "microsoft": {"microsoft.com", "office.com", "live.com"},
-    "google": {"google.com", "accounts.google.com", "gmail.com"},
-    "amazon": {"amazon.com"},
-    # add domains here as needed
+    "microsoft": {"microsoft.com", "microsoftonline.com", "office.com", "office365.com",
+                  "live.com", "outlook.com", "sharepoint.com", "onmicrosoft.com"},
+    "google": {"google.com", "gmail.com", "googleusercontent.com"},
+    "apple": {"apple.com", "icloud.com"},
+    "amazon": {"amazon.com", "amazonaws.com"},
+    "bankofamerica": {"bankofamerica.com"},
+    "chase": {"chase.com", "jpmorganchase.com"},
+    "wellsfargo": {"wellsfargo.com"},
 }
+BRAND_ALIASES = {"office365": "microsoft", "outlook": "microsoft"}
+SHORTENER_HOSTS = frozenset({"bit.ly", "tinyurl.com", "t.co", "ow.ly", "is.gd",
+                            "buff.ly", "cutt.ly", "rebrand.ly", "shorturl.at"})
+REDIRECT_PARAMETERS = frozenset({"redirect", "redirect_uri", "redirect_url", "url",
+                                  "target", "destination", "dest", "continue", "next", "return_url"})
+# This must correspond to an upstream gateway that removes untrusted incoming
+# Authentication-Results headers before inserting its own authoritative results.
+TRUSTED_AUTH_SERVERS = frozenset(
+    part.strip().lower().rstrip(".")
+    for part in os.getenv("TRUSTED_AUTH_SERVERS", "").split(",") if part.strip()
+)
+
 
 VERSION = None
 
@@ -730,118 +757,210 @@ def looks_random_segment(segment: str) -> bool:
     vowels = sum(1 for c in segment.lower() if c in "aeiou")
     return vowels / len(segment) < 0.2
 
+def _host_matches_root(host: str, root: str) -> bool:
+    """Label-boundary comparison; paypal.com.evil.test is never paypal.com."""
+    return host == root or host.endswith("." + root)
+
+
+def _normalized_host(host: str) -> str:
+    try:
+        return (host or "").rstrip(".").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return ""
+
+
+def _same_domain_family(first: str | None, second: str | None) -> bool:
+    """Conservative relationship; not an eTLD+1 or DMARC relaxed-alignment test."""
+    left = _normalized_host(first or "")
+    right = _normalized_host(second or "")
+    return bool(left and right and (_host_matches_root(left, right) or _host_matches_root(right, left)))
+
+
+def _is_close_brand_label(label: str, brand: str) -> bool:
+    """Detect common single-character brand typos without broad fuzzy matching."""
+    if len(brand) < 6 or abs(len(label) - len(brand)) > 1:
+        return False
+    if label == brand:
+        return True
+    if len(label) == len(brand):
+        differences = [i for i, (a, b) in enumerate(zip(label, brand)) if a != b]
+        if len(differences) == 1:
+            return True
+        if len(differences) == 2:
+            a, b = differences
+            return b == a + 1 and label[a] == brand[b] and label[b] == brand[a]
+        return False
+    # One added or removed character (e.g. microsofft.com).
+    shorter, longer = sorted((label, brand), key=len)
+    i = j = edits = 0
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+        else:
+            edits += 1
+            if edits > 1:
+                return False
+        j += 1
+    return True
+
+
+def _brand_spoof_targets(host: str) -> list[str]:
+    """Find brand labels on hosts that aren't under that brand's curated root."""
+    ascii_host = _normalized_host(host)
+    unicode_host = decode_idn(ascii_host).lower()
+    labels = re.split(r"[.\-_]", unicode_host)
+    joined = unicode_host.replace("-", "").replace("_", "")
+    matches = []
+    for brand, roots in TRUSTED_BRAND_DOMAINS.items():
+        aliases = (brand,) + tuple(k for k, v in BRAND_ALIASES.items() if v == brand)
+        if any(_host_matches_root(ascii_host, root) for root in roots):
+            continue
+        if any(alias in joined for alias in aliases) or any(
+            (normalize_homoglyphs(label) in aliases or
+             any(_is_close_brand_label(normalize_homoglyphs(label), alias) for alias in aliases))
+            for label in labels
+        ):
+            matches.append(brand)
+    return matches
+
+
 def analyze_url(url: str, analysis_results) -> dict:
-    """
-    Analyze a single normalized URL and return:
-    {
-        "url": "...",
-        "domain": "...",
-        "flags": [...],
-    }
-    """
+    """Assess a URL locally; do not connect to or resolve its destination."""
     normalized = normalize_url(url)
     if normalized is None:
-        return {"url": url, "domain": "", "flags": ["INVALID_URL"]}
-    url = normalized
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    domain = host.lower()
+        return {"url": url, "domain": "", "flags": ["INVALID_URL"], "score": 0}
+    parsed = urlparse(normalized)
+    host = _normalized_host(parsed.hostname or "")
     flags: list[str] = []
+    signals: list[tuple[str, int]] = []
 
-    # 1) IP-literal
-    if is_ip_literal_url(url):
-        flags.append("IP_LITERAL")
-        add_finding(
-            analysis_results,
-            category=Category.URLs,
-            code=Code.URL_IP_LITERAL,
-            severity=Severity.HIGH,
-            message=f"URL host is a literal IP: {url}",
-            url=url,
-        )
+    def flag(name: str, points: int, code: Code | None = None,
+             severity: Severity = Severity.MEDIUM, message: str = "") -> None:
+        flags.append(name)
+        if points:
+            signals.append((name, points))
+        if code is not None:
+            add_finding(analysis_results, Category.URLs, code, severity,
+                        message or name, url=normalized, signal_weight=points)
 
-    # 2) Suspicious TLD
-    # crude: last label after the final dot
-    parts = domain.split(".")
-    tld = parts[-1] if len(parts) > 1 else ""
-    if tld in SUSPICIOUS_TLDS:
-        flags.append("SUSPICIOUS_TLD")
-        add_finding(
-            analysis_results,
-            category=Category.URLs,
-            code=Code.URL_SUSPICIOUS_TLD,
-            severity=Severity.HIGH,
-            message=f"URL host has a suspicious tld: {url}",
-            url=url,
-        )
-
-    # 3) Punycode / IDN
-    if "xn--" in domain:
-        flags.append("PUNYCODE_DOMAIN")
-        add_finding(
-            analysis_results,
-            category=Category.URLs,
-            code=Code.URL_PUNYCODE,
-            severity=Severity.HIGH,
-            message=f"URL has a punycode domain: {url}",
-            url=url,
-        )
-
-    # 4) HTTP (no HTTPS)
+    if is_ip_literal_url(normalized):
+        flag("IP_LITERAL", 42, Code.URL_IP_LITERAL, Severity.HIGH, "Link uses a literal IP address")
+    if parsed.username is not None or parsed.password is not None:
+        flag("URL_USERINFO", 55, Code.URL_USERINFO, Severity.HIGH,
+             "Link contains an @-userinfo prefix that can hide its actual host")
+    if parsed.port is not None and parsed.port not in {80, 443}:
+        flag("UNUSUAL_PORT", 12, Code.URL_UNUSUAL_PORT, Severity.LOW,
+             "Link uses a nonstandard web port")
+    # TLD popularity is weak evidence, not proof of maliciousness.
+    if host.split(".")[-1] in SUSPICIOUS_TLDS:
+        flag("SUSPICIOUS_TLD", 6, Code.URL_SUSPICIOUS_TLD, Severity.LOW,
+             "Link has a TLD sometimes abused in phishing; this alone is weak evidence")
+    if any(label.startswith("xn--") for label in host.split(".")):
+        decoded = decode_idn(host)
+        flag("PUNYCODE_DOMAIN", 10, Code.URL_PUNYCODE, Severity.LOW,
+             f"Internationalized domain encoding: {decoded}")
+        if contains_cyrillic(decoded) and contains_latin(decoded):
+            flag("MIXED_SCRIPT", 38, Code.URL_MIXED_SCRIPT, Severity.HIGH,
+                 "Link mixes Latin and Cyrillic characters within its hostname")
     if parsed.scheme == "http":
-        flags.append("PLAIN_HTTP")
-
-    # 5) Suspicious path keywords
-    path_lower = (parsed.path or "").lower()
-    query_lower = (parsed.query or "").lower()
-    for kw in SUSPICIOUS_PATH_KEYWORDS:
-        if kw in path_lower or kw in query_lower:
-            flags.append(f"KEYWORD_{kw.upper()}")
-            # don't break; we want all hits
-            add_finding(
-                analysis_results,
-                category=Category.URLs,
-                code=Code.URL_SUSPICIOUS_PATH,
-                severity=Severity.HIGH,
-                message=f"URL has suspicous path keywords: {url}",
-                url=url,
-            )
-
-    # 6) Random-looking path segments
-    segments = [seg for seg in parsed.path.split("/") if seg]
-    randomish_count = sum(1 for seg in segments if looks_random_segment(seg))
-    if randomish_count >= 2:
-        flags.append("OBFUSCATED_PATH")
-        add_finding(
-            analysis_results,
-            category=Category.URLs,
-            code=Code.URL_OBFUSCATED_PATH,
-            severity=Severity.HIGH,
-            message=f"URL has obfuscated path: {url}",
-            url=url,
-        )
-
-    # 7) Brand impersonation-ish
-    for brand in BRAND_KEYWORDS:
-        if brand in domain:
-            trusted = TRUSTED_BRAND_DOMAINS.get(brand, set())
-            if domain not in trusted:
-                flags.append(f"BRAND_IMPERSONATION_{brand.upper()}")
-                add_finding(
-                    analysis_results,
-                    category=Category.URLs,
-                    code=Code.URL_BRAND_IMPERSONATION,
-                    severity=Severity.HIGH,
-                    message=f"URL may be attempting brand impersonation: {url}",
-                    url=url,
-                )
+        flag("PLAIN_HTTP", 3)
+    path_query = unquote(parsed.path + "?" + parsed.query).lower()[:4096]
+    found_keywords = [kw for kw in SUSPICIOUS_PATH_KEYWORDS if re.search(
+        r"(?<![a-z])" + re.escape(kw) + r"(?![a-z])", path_query)]
+    if found_keywords:
+        flag("SUSPICIOUS_PATH_KEYWORDS", 5, Code.URL_SUSPICIOUS_PATH, Severity.LOW,
+             "Login/account vocabulary appears in URL path or query (weak signal)")
+    if sum(looks_random_segment(segment) for segment in parsed.path.split("/") if segment) >= 2:
+        flag("OBFUSCATED_PATH", 17, Code.URL_OBFUSCATED_PATH, Severity.MEDIUM,
+             "URL contains multiple random-looking path segments")
+    for brand in _brand_spoof_targets(host):
+        flag(f"BRAND_IMPERSONATION_{brand.upper()}", 65, Code.URL_BRAND_IMPERSONATION,
+             Severity.HIGH, f"Host appears to impersonate {brand}, but is not under its recognized domains")
+    if host in SHORTENER_HOSTS:
+        flag("URL_SHORTENER", 8, Code.URL_SHORTENER, Severity.LOW,
+             "URL uses a known shortening service (destination not followed)")
+    try:
+        parameters = parse_qs(parsed.query, keep_blank_values=False, max_num_fields=100)
+    except ValueError:
+        # An oversized query is suspicious but must not crash the analysis.
+        parameters = {}
+        flag("EXCESSIVE_QUERY_PARAMS", 8)
+    for parameter, values in parameters.items():
+        if parameter.lower() not in REDIRECT_PARAMETERS:
+            continue
+        for value in values[:4]:
+            candidate = normalize_url(unquote(value[:4096]))
+            if candidate and not _same_domain_family(host, urlparse(candidate).hostname):
+                flag("EXTERNAL_REDIRECT", 25, Code.URL_EXTERNAL_REDIRECT, Severity.MEDIUM,
+                     "URL includes a redirect parameter pointing to another domain")
+                break
+        if "EXTERNAL_REDIRECT" in flags:
             break
+    # Sum capped independent URL evidence; 3+ unrelated indicators increase confidence.
+    score = min(100, max((weight for _, weight in signals), default=0)
+                + min(32, sum(sorted((weight for _, weight in signals), reverse=True)[1:3]) // 2))
+    return {"url": normalized, "domain": host, "flags": flags, "score": score}
 
-    return {
-        "url": url,
-        "domain": domain,
-        "flags": flags,
-    }
+
+class _VisibleLinkExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "a":
+            self._href = next((v for k, v in attrs if k.lower() == "href" and v), None)
+            self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self._href is not None:
+            self.links.append((self._href, "".join(self._text).strip()))
+            self._href = None
+            self._text = []
+
+
+def analyze_displayed_links(html_body: str | None, analysis_results: list[dict]) -> list[dict]:
+    """Compare a visible URL in anchor text with the actual href, never fetching either."""
+    if not html_body:
+        return []
+    parser = _VisibleLinkExtractor()
+    try:
+        parser.feed(html_body[:1_000_000])
+    except (ValueError, AssertionError):
+        return []
+    result: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for href, visible in parser.links[:500]:
+        target = normalize_url(href)
+        visible_text = unescape(visible).strip()
+        candidate = URL_REGEX.search(visible_text)
+        shown = normalize_url(candidate.group(1)) if candidate else None
+        # Some phishing anchors show a bare domain without https:// or www.
+        if shown is None and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,24}/?", visible_text):
+            shown = normalize_url("https://" + visible_text)
+        if not target or not shown:
+            continue
+        host = _normalized_host(urlparse(target).hostname or "")
+        shown_host = _normalized_host(urlparse(shown).hostname or "")
+        if not host or not shown_host or _same_domain_family(host, shown_host):
+            continue
+        key = (shown_host, host)
+        if key in seen:
+            continue
+        seen.add(key)
+        add_finding(analysis_results, Category.URLs, Code.URL_LINK_TEXT_MISMATCH,
+                    Severity.HIGH, "Displayed link domain differs from actual destination",
+                    displayed_domain=shown_host, actual_domain=host, url=target,
+                    signal_weight=75)
+        result.append({"url": target, "domain": host,
+                       "flags": ["LINK_TEXT_MISMATCH"], "score": 75})
+    return result
 
 def parse_headers_from_file(path: str):
     """
@@ -932,6 +1051,146 @@ def parse_auth_results_header(header_value: str) -> dict:
         results[mech.lower()] = status.lower()
 
     return results
+
+def _authserv_id(header: str) -> str:
+    """Return the Authentication-Results authserv-id, before any result methods."""
+    first = str(header).split(";", 1)[0].strip().split()
+    return first[0].lower().rstrip(".") if first else ""
+
+
+def _auth_property(header: str, name: str) -> str | None:
+    match = re.search(r"(?<![\w.-])" + re.escape(name) +
+                      r"\s*=\s*(?:\"([^\"]+)\"|([^;\s()]+))", header, re.I)
+    return (match.group(1) or match.group(2)).strip().lower() if match else None
+
+
+def evaluate_authentication(headers: list[str], from_domain: str | None) -> dict[str, Any]:
+    """Only trust authenticated results from explicitly configured upstream authority.
+
+    IMPORTANT: TRUSTED_AUTH_SERVERS is safe ONLY if the trusted ingress removes
+    untrusted Authentication-Results headers from inbound messages. Header IDs
+    alone are forgeable, so a configuration is not cryptographic verification.
+    """
+    selected = next((str(h) for h in headers if _authserv_id(str(h)) in TRUSTED_AUTH_SERVERS), None)
+    if not selected:
+        return {"trusted": False, "status": "unverified", "authserv_id": None,
+                "spf": None, "dkim": None, "dmarc": None,
+                "spf_domain": None, "dkim_domain": None, "alignment": "unknown",
+                "score": 0, "warnings": [
+                    "Authentication-Results not verified; SPF/DKIM/DMARC header claims are excluded from scoring."
+                ]}
+    methods = parse_auth_results_header(selected)
+    spf, dkim, dmarc = (methods.get(m) for m in ("spf", "dkim", "dmarc"))
+    spf_domain = _auth_property(selected, "smtp.mailfrom")
+    dkim_domain = _auth_property(selected, "header.d")
+    # Strict alignment is determinable; relaxed organizational-domain alignment
+    # must not be guessed from suffixes without the Public Suffix List.
+    spf_exact = bool(from_domain and spf_domain and
+                     _normalized_host(from_domain) == _normalized_host(spf_domain))
+    dkim_exact = bool(from_domain and dkim_domain and
+                      _normalized_host(from_domain) == _normalized_host(dkim_domain))
+    if dmarc == "pass":
+        alignment = "pass (reported by trusted receiver)"
+    elif dmarc == "fail":
+        alignment = "fail (reported by trusted receiver)"
+    elif (spf == "pass" and spf_exact) or (dkim == "pass" and dkim_exact):
+        alignment = "strict alignment observed; DMARC result unavailable"
+    else:
+        alignment = "unknown; relaxed alignment not inferred"
+    score = (85 if dmarc == "fail" else
+             25 if dmarc != "pass" and spf == "fail" and dkim == "fail" else
+             15 if dmarc != "pass" and (spf == "fail" or dkim == "fail") else 0)
+    return {"trusted": True, "status": "reported by configured receiver",
+            "authserv_id": _authserv_id(selected), "spf": spf, "dkim": dkim,
+            "dmarc": dmarc, "spf_domain": spf_domain, "dkim_domain": dkim_domain,
+            "alignment": alignment, "score": score, "warnings": []}
+
+
+def _risk_label(score: int) -> str:
+    if score >= 75:
+        return "CRITICAL"
+    if score >= 50:
+        return "HIGH"
+    if score >= 25:
+        return "MEDIUM"
+    return "LOW"
+
+
+def build_risk_assessment(*, findings: list[dict[str, Any]], url_analysis: list[dict],
+                          auth: dict[str, Any], se_score: int,
+                          attachment_scores: list[int], yara_count: int,
+                          sender_score: int, limitations: list[str]) -> dict[str, Any]:
+    """Deterministic and conservative HEURISTIC, not a calibrated probability.
+
+    Correlated evidence is capped per category. Never score unverified headers,
+    benign WHOIS lookup failures, or mere re-observation of historical IOCs.
+    """
+    url_scores = sorted((int(item.get("score", 0)) for item in url_analysis), reverse=True)
+    url_score = min(100, (url_scores[0] if url_scores else 0)
+                    + min(15, sum(url_scores[1:3]) // 5))
+    attachment_score = max(attachment_scores, default=0)
+    if yara_count:
+        attachment_score = max(attachment_score, min(100, 65 + 8 * min(yara_count, 4)))
+    groups = [
+        ("authentication", "Authentication", int(auth.get("score", 0)), 0.27),
+        ("sender", "Sender identity", int(sender_score), 0.18),
+        ("urls", "URLs & domains", url_score, 0.32),
+        ("social", "Social engineering", int(se_score), 0.13),
+        ("attachments", "Attachments & YARA", attachment_score, 0.10),
+    ]
+    components = [{"id": key, "label": label, "score": max(0, min(100, value))}
+                  for key, label, value, _ in groups]
+    raw = sum(max(0, min(100, value)) * weight for _, _, value, weight in groups)
+    supporting = sum(value >= 50 for _, _, value, _ in groups)
+    # Multiple independent types of evidence increase confidence.
+    synergy = 15 if supporting >= 3 else 8 if supporting == 2 else 0
+    overall = min(100, round(raw + synergy))
+    # Explicit visual-link deception or brand spoofing is meaningful even in an
+    # otherwise benign-looking message. DMARC fail alone remains MEDIUM unless
+    # independent evidence corroborates it (legitimate misconfigurations occur).
+    url_flags = {flag for item in url_analysis for flag in item.get("flags", [])}
+    if ("LINK_TEXT_MISMATCH" in url_flags
+            or any(flag.startswith("BRAND_IMPERSONATION_") for flag in url_flags)):
+        overall = max(overall, 55)
+    if auth.get("trusted") and auth.get("dmarc") == "fail":
+        overall = max(overall, 30)
+
+    notable = [f for f in findings if f.get("severity") in {"critical", "high", "medium"}
+               and f.get("code") not in {Code.SPF_STATUS.value, Code.DKIM_STATUS.value,
+                                          Code.DMARC_STATUS.value}]
+    # Keep the report concise, while retaining full findings separately.
+    unique: list[str] = []
+    for item in notable:
+        message = str(item.get("message", "")).strip()
+        if message and message not in unique:
+            unique.append(message)
+        if len(unique) == 5:
+            break
+    if yara_count:
+        unique.insert(0, f"YARA matched {yara_count} rule(s); investigate the actual matching patterns")
+    warnings = list(dict.fromkeys([*auth.get("warnings", []), *limitations]))
+    return {"score": overall, "verdict": _risk_label(overall),
+            "method": "heuristic-v1", "components": components,
+            "key_findings": unique[:5], "limitations": warnings,
+            "completeness": "limited" if warnings else "standard"}
+
+
+def print_risk_assessment(risk: dict[str, Any]) -> None:
+    color = (BRIGHT_RED if risk["score"] >= 75 else RED if risk["score"] >= 50
+             else YELLOW if risk["score"] >= 25 else BRIGHT_GREEN)
+    print(CYAN + "\n=== Unified Risk Assessment ===" + RESET)
+    print(f"Overall risk: {color}{risk['score']}/100 [{risk['verdict']}]{RESET}")
+    for item in risk["components"]:
+        score = item["score"]
+        bar = "#" * (score // 5) + "." * (20 - score // 5)
+        print(f"  {item['label']:<22} [{bar}] {score:3d}/100")
+    if risk["key_findings"]:
+        print("Key evidence:")
+        for finding in risk["key_findings"]:
+            print(f"  - {finding}")
+    for warning in risk["limitations"][:3]:
+        print(YELLOW + f"  Note: {warning}" + RESET)
+    print("Scoring is heuristic, not a probability or a definitive verdict.\n")
 
 def has_crosstenant_headers(headers: dict) -> bool:
     """
@@ -2018,11 +2277,14 @@ def detect_bad_epilogue(file_path):
 def run_analysis(file_path: str,
                  use_json: bool = False,
                  show_spinners: bool = True,
-                 show_mime: bool = False):
+                 show_mime: bool = False,
+                 summary_out: dict[str, Any] | None = None):
 
     print_banner()
 
     analysis_results = []
+    attachment_scores: list[int] = []
+    analysis_limitations: list[str] = []
 
     # Track all finding codes for ATT&CK mapping at the end
     attack_finding_codes: list[str] = []
@@ -2070,6 +2332,9 @@ def run_analysis(file_path: str,
         att for att in attachments
         if isinstance(att.get("payload"), bytes) and bool(att["payload"])
     ]
+    if any(att.get("virtual_kind") == "pdf_link" for att in attachments):
+        analysis_limitations.append(
+            "Linked PDF references were not downloaded or byte-scanned.")
     if attachments:
             print(BRIGHT_GREEN + "[+] Email attachments detected" + RESET)
             for attachment in attachments:
@@ -2094,6 +2359,11 @@ def run_analysis(file_path: str,
                 if show_spinners:
                     analyzeSpinner.stop()
 
+                attachment_scores.append(score)
+                if any(f.code in {"pdf_parser_unavailable", "pdf_deep_scan_skipped",
+                                  "zip_scan_limited"} for f in findings):
+                    analysis_limitations.append(
+                        f"Deep inspection was unavailable or limited for {attachment['filename']}.")
                 # Structured findings are also needed by JSON and PDF reporters.
                 for finding in findings:
                     analysis_results.append({
@@ -2172,7 +2442,6 @@ def run_analysis(file_path: str,
 
     auth_results_headers = (msg.get_all("authentication-results") or [])
     has_auth_headers = bool(auth_results_headers)
-    auth_spf = auth_dkim = auth_dmarc = None
 
     # ----------------------------------------------------------
     # END - Pull Headers from Headers Block
@@ -2211,6 +2480,7 @@ def run_analysis(file_path: str,
             if linked_url and linked_url not in found_URLS:
                 found_URLS.append(linked_url)
     url_analysis = [analyze_url(u, analysis_results) for u in found_URLS]
+    url_analysis.extend(analyze_displayed_links(html_body, analysis_results))
 
     if plain_body:
         print(CYAN + "\n=== Plain text body (first 400 chars) ===" + RESET)
@@ -2252,7 +2522,7 @@ def run_analysis(file_path: str,
                         attack_finding_codes.append("URL_OBFUSCATED_PATH")
                     elif flag.startswith("BRAND_IMPERSONATION"):
                         attack_finding_codes.append("URL_BRAND_IMPERSONATION")
-                    elif flag.startswith("KEYWORD_"):
+                    elif flag in {"SUSPICIOUS_PATH_KEYWORDS"}:
                         attack_finding_codes.append("URL_SUSPICIOUS_PATH")
 
 
@@ -2268,33 +2538,7 @@ def run_analysis(file_path: str,
 
     print()
 
-    if auth_results_headers:
-        primary_auth = auth_results_headers[0]
-        auth_parsed = parse_auth_results_header(primary_auth)
-        auth_spf = auth_parsed.get("spf")
-        auth_dkim = auth_parsed.get("dkim")
-        auth_dmarc = auth_parsed.get("dmarc")
-
-        if auth_dkim:
-            add_finding(
-                analysis_results,
-                category=Category.AUTH_RESULTS,
-                code=Code.DKIM_STATUS,
-                severity=Severity.INFO if auth_dkim == "pass" else Severity.MEDIUM,
-                message=f"DKIM status: {auth_dkim}",
-                status=auth_dkim,
-            )
-
-        if auth_dmarc:
-            add_finding(
-                analysis_results,
-                category=Category.AUTH_RESULTS,
-                code=Code.DMARC_STATUS,
-                severity=Severity.INFO if "pass" in auth_dmarc else Severity.MEDIUM,
-                message=f"DMARC status: {auth_dmarc}",
-                status=auth_dmarc,
-            )
-
+    # Authentication-Results are evaluated after we know the visible From domain.
 
     # Parse received-spf
     received_spf_hdrs = (msg.get_all("received-spf") or [])
@@ -2312,17 +2556,8 @@ def run_analysis(file_path: str,
 
     spf_result = parsed_spf_hdr.get("result") if parsed_spf_hdr else None
     spf_client_ip = parsed_spf_hdr.get("client_ip") if parsed_spf_hdr else None
-    if spf_result:
-        add_finding(
-                analysis_results,
-                category=Category.SPF,
-                code=Code.SPF_STATUS,
-                severity=(Severity.INFO if spf_result == "pass" else
-                          Severity.HIGH if spf_result in {"fail", "softfail"} else
-                          Severity.LOW),
-                message=f"SPF status: {spf_result}",
-                status=spf_result,
-            )
+    # Received-SPF is a claim in the message, never independently verified here.
+    # It will only appear as descriptive context; scoring uses trusted A-R results.
 
     # Check for CrossTenant Headers
     cross_tenant = has_crosstenant_headers(msg)
@@ -2377,8 +2612,8 @@ def run_analysis(file_path: str,
             analysis_results,
             category=Category.HEADERS,
             code=Code.CROSSTENANT_PRESENT,
-            severity=Severity.INFO if from_domain != to_domain else Severity.HIGH,
-            message="Cross tenant headers detected for internal email.",
+            severity=Severity.INFO,
+            message="Cross-tenant header(s) present (informational; not proof of spoofing).",
             status=cross_tenant,
         )
 
@@ -2397,10 +2632,22 @@ def run_analysis(file_path: str,
     if from_domain != to_domain and cross_tenant:
         print(f"{BRIGHT_GREEN}Cross Tenant:           {cross_tenant}{RESET}")
     if from_domain == to_domain and cross_tenant:
-        attack_finding_codes.append("CROSSTENANT_PRESENT")
         print(f"{BRIGHT_RED}Cross Tenant:           {cross_tenant}{RESET}")
     print(f"Reply-To domain:        {reply_to_domain}")
     print(f"Return-Path domain:     {return_path_domain}")
+    sender_risk = 0
+    if from_domain and reply_to_domain and not _same_domain_family(from_domain, reply_to_domain):
+        sender_risk = max(sender_risk, 42)
+        add_finding(analysis_results, Category.HEADERS, Code.SENDER_REPLYTO_MISMATCH,
+                    Severity.MEDIUM, "Reply-To domain differs from visible From domain",
+                    from_domain=from_domain, reply_to_domain=reply_to_domain)
+    if from_domain and return_path_domain and not _same_domain_family(from_domain, return_path_domain):
+        # Common for legitimate ESPs and bounce handling: informational only.
+        add_finding(analysis_results, Category.HEADERS, Code.FROM_RETURNPATH_MISMATCH,
+                    Severity.INFO, "Return-Path differs from From (may be legitimate mailing service)",
+                    from_domain=from_domain, return_path_domain=return_path_domain)
+    if not from_domain:
+        sender_risk = 80
     print()
 
     print(f"{CYAN}=== Cyrillic Detection ==={RESET}")
@@ -2408,6 +2655,10 @@ def run_analysis(file_path: str,
     if cyrillic_from_domain:
         for f in cyrillic_from_domain:
             attack_finding_codes.append(f.code)
+            sender_risk = max(sender_risk, min(90, f.weight + 25))
+            analysis_results.append({"category": Category.HEADERS.value,
+                                     "code": f.code, "severity": Severity.HIGH.value,
+                                     "message": f.message, "data": {"evidence": f.evidence}})
             print(YELLOW + f.message + RESET)
     else:
         print(f"{YELLOW}[*] No cyrillic characters detected for {from_domain}{RESET}")
@@ -2483,48 +2734,39 @@ def run_analysis(file_path: str,
         print()
 
     # ----------------------------------------------------------------------
-    # Output Authentication Header Results
+    # Trusted authentication interpretation
     # ----------------------------------------------------------------------
-    if auth_results_headers:
-        print(f"{CYAN}=== Parsed Authentication Results ==={RESET}")
-        print(f"spf: {auth_spf}")
-        if auth_dkim == "fail":
+    authentication = evaluate_authentication(
+        [str(h) for h in auth_results_headers], from_domain)
+    print(f"{CYAN}=== Authentication Interpretation ==={RESET}")
+    if authentication["trusted"]:
+        print(f"Receiver: {authentication['authserv_id']} (configured trusted ingress)")
+        print(f"SPF: {authentication['spf']}  smtp.mailfrom: {authentication['spf_domain']}")
+        print(f"DKIM: {authentication['dkim']}  header.d: {authentication['dkim_domain']}")
+        print(f"DMARC: {authentication['dmarc']}  Alignment: {authentication['alignment']}")
+        for name, code in (("spf", Code.SPF_STATUS), ("dkim", Code.DKIM_STATUS),
+                           ("dmarc", Code.DMARC_STATUS)):
+            value = authentication.get(name)
+            if value:
+                add_finding(analysis_results, Category.AUTH_RESULTS, code,
+                            Severity.HIGH if name == "dmarc" and value == "fail" else Severity.INFO,
+                            f"Trusted receiver reports {name.upper()}: {value}", status=value,
+                            authserv_id=authentication["authserv_id"])
+        if authentication["dmarc"] == "fail":
+            attack_finding_codes.append("DMARC_FAIL")
+        if authentication["dkim"] == "fail" and authentication["dmarc"] != "pass":
             attack_finding_codes.append("DKIM_FAIL")
-        print(f"dkim: {auth_dkim}")
-        print(f"dmarc: {auth_dmarc}")
-        print()
+        if authentication["spf"] == "fail" and authentication["dmarc"] != "pass":
+            attack_finding_codes.append("SPF_FAIL")
+    else:
+        print(YELLOW + "Unverified: no trusted Authentication-Results header selected." + RESET)
+        if auth_results_headers:
+            print("Authentication headers exist but cannot be trusted for scoring.")
+        if received_spf_hdrs:
+            print(f"Received-SPF claims: {spf_result} (unverified)")
+    print("Trusted receiver IDs must only be enabled for sanitized gateway-provided headers.")
+    print()
 
-    if auth_dmarc == 'fail':
-        print(f"{RED}=== Email DMARC Failed Check ==={RESET}")
-        print("Emails that fail DMARC checking are more likely phishing emails.")
-        print()
-        add_finding(
-                analysis_results,
-                category=Category.DMARC,
-                code=Code.DMARC_FAIL,
-                severity=Severity.HIGH,
-                message="DMARC Failed Check",
-                status=auth_dmarc,
-            )
-
-    if from_domain == to_domain and hasSPFHeaders:
-        if spf_result == 'fail' or auth_spf == 'fail' or auth_dmarc == 'fail':
-            print(f"{RED}=== Internal Spoofing evidence found ==={RESET}")
-            if spf_result == "fail" or auth_spf == 'fail':
-                attack_finding_codes.append(f"SPF_FAIL")
-                print(f"SPF Failed -> Origin IP = {spf_client_ip} for domain -> {from_domain}")
-            if org_authAs_hdr == "Anonymous":
-                print(f"AuthAs -> {org_authAs_hdr}")
-            if auth_dmarc == 'fail':
-                attack_finding_codes.append("DMARC_FAIL")
-                print(f"DMARC Check -> {auth_dmarc}")
-            print()
-
-    if from_domain != to_domain:
-        if spf_result == "fail" or auth_spf == 'fail':
-            print(f"{RED}=== External Spoofing evidence found ==={RESET}")
-            print(f"SPF Failed -> Origin IP = {spf_client_ip}")
-        print()
 
     # Print if no From Headers are found
     if from_hdr is None:
@@ -2605,24 +2847,6 @@ def run_analysis(file_path: str,
             "RESET":        RESET,
         })
 
-        # save IOCs AFTER correlation so current run doesn't match itself
-        analysis_id = save_analysis(
-            file_name=file_path,
-            risk_score=None,
-            se_score=se_result.score if 'se_result' in dir() else None,
-            verdict=None,
-        )
-
-        extract_and_save_iocs(
-            analysis_id=analysis_id,
-            from_domain=from_domain,
-            reply_domain=reply_to_domain,
-            return_domain=return_path_domain,
-            client_ip=spf_client_ip,
-            urls=found_URLS if found_URLS else [],
-            attachments=scannable_attachments,
-            mailer=msg.get("X-Mailer") or msg.get("User-Agent"),
-        )
 
     # ----------------------------------------------------------
     # YARA Rule Scanning
@@ -2642,12 +2866,48 @@ def run_analysis(file_path: str,
         "RESET":        RESET,
     }))
 
-    # Feed YARA findings into ATT&CK mapping
+    # Feed YARA findings into ATT&CK mapping and the structured PDF findings.
     for match in yara_matches:
+        analysis_results.append({
+            "category": Category.CONTENT.value,
+            "code": f"YARA_{match.rule_name}",
+            "severity": Severity.HIGH.value,
+            "message": f"YARA rule matched: {match.rule_name}",
+            "data": {"attack_ids": list(match.attack_ids)},
+        })
         attack_finding_codes.append(f"YARA_{match.rule_name}")
         # Also feed the technique IDs directly since YARA rules declare them
         for attack_id in match.attack_ids:
             attack_finding_codes.append(attack_id)
+
+    # ----------------------------------------------------------
+    # Overall assessment: combine independent evidence, not every duplicate flag.
+    # ----------------------------------------------------------
+    risk = build_risk_assessment(
+        findings=analysis_results, url_analysis=url_analysis,
+        auth=authentication, se_score=se_result.score,
+        attachment_scores=attachment_scores, yara_count=len(yara_matches),
+        sender_score=sender_risk,
+        limitations=analysis_limitations,
+    )
+    print_risk_assessment(risk)
+    if summary_out is not None:
+        summary_out.clear()
+        summary_out.update(risk)
+
+    # Persist ONCE after correlation and full scoring. Current run does not match itself.
+    if THREAT_INTEL_ENABLED:
+        analysis_id = save_analysis(
+            file_name=file_path, risk_score=risk["score"],
+            se_score=se_result.score, verdict=risk["verdict"],
+        )
+        extract_and_save_iocs(
+            analysis_id=analysis_id, from_domain=from_domain,
+            reply_domain=reply_to_domain, return_domain=return_path_domain,
+            client_ip=spf_client_ip, urls=found_URLS,
+            attachments=scannable_attachments,
+            mailer=msg.get("X-Mailer") or msg.get("User-Agent"),
+        )
 
     # ----------------------------------------------------------
     # MITRE ATT&CK Coverage
@@ -2663,7 +2923,7 @@ def run_analysis(file_path: str,
     # pretty-print JSON for now (CLI use)
     if use_json:
         print("\nJSON analysis results:")
-        print(json.dumps({"analysis_results": analysis_results}, indent=2))
+        print(json.dumps({"analysis_results": analysis_results, "risk_assessment": risk}, indent=2))
 
     print(rf"""{BRIGHT_GREEN}
 ==================================================
@@ -2675,7 +2935,8 @@ def run_analysis(file_path: str,
     return analysis_results
 
 def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
-    analysis_results = []  # your existing findings list
+    analysis_results: list[dict[str, Any]] = []
+    risk_assessment: dict[str, Any] = {}
 
     # Read the message once for PDF metadata rather than reparsing it separately
     # for its body and Received headers.
@@ -2685,7 +2946,8 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
 
     # ... run your usual logic to fill analysis_results and capture text_output ...
     text_output = run_analysis_capture_text(file_path, use_json=False, strip_ansi=False,
-                                            show_mime=show_mime, findings_out=analysis_results)
+                                            show_mime=show_mime, findings_out=analysis_results,
+                                             summary_out=risk_assessment)
 
     hops = parse_received_hops(pdf_msg.get_all("Received") or [])
 
@@ -2696,8 +2958,9 @@ def run_analysis_and_pdf(file_path: str, pdf_path: str, show_mime: bool):
 
     metadata = {
         "file_name": file_path,
-        "overall_verdict": "N/A",  # or whatever you compute
-        "overall_score": "N/A",              # optional
+        "overall_verdict": risk_assessment.get("verdict", "N/A"),
+        "overall_score": risk_assessment.get("score"),
+        "risk_assessment": risk_assessment,
         "analyzed_at": datetime.now(),
         "email_body": email_body,
         "received_hops": hops
@@ -2715,7 +2978,8 @@ def run_analysis_capture_text(file_path: str,
                               use_json: bool = False,
                               strip_ansi: bool = True,
                               show_mime: bool = False,
-                              findings_out: list[dict[str, Any]] | None = None) -> str:
+                              findings_out: list[dict[str, Any]] | None = None,
+                               summary_out: dict[str, Any] | None = None) -> str:
     """
     Run the analysis and capture the full terminal-style output
     as a single string, instead of printing it to the real terminal.
@@ -2723,7 +2987,8 @@ def run_analysis_capture_text(file_path: str,
     buffer = io.StringIO()
     # Redirect stdout into our buffer while run_analysis executes
     with contextlib.redirect_stdout(buffer):
-        findings = run_analysis(file_path, use_json=use_json, show_spinners=False, show_mime=show_mime)
+        findings = run_analysis(file_path, use_json=use_json, show_spinners=False,
+                                show_mime=show_mime, summary_out=summary_out)
     if findings_out is not None:
         findings_out.extend(findings)
 
