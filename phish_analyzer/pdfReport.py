@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pathlib import Path
+import tempfile
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -89,29 +90,32 @@ def generate_pdf_report(
 
         if is_html(email_body):
 
-            html_png_path = render_html_to_png(
-                email_body,
-                output_png_path="./reports/email_render.png",
-                viewport_width=900,
-                viewport_height=1200,
-                full_page=True,
-            )
+            # Each report gets a private renderer scratch directory. Reusing
+            # ./reports/email_render.png would cause concurrent PDF data races.
+            with tempfile.TemporaryDirectory(prefix="phish-render-") as render_dir:
+                html_png_path = render_html_to_png(
+                    email_body,
+                    output_png_path=str(Path(render_dir) / "email_render.png"),
+                    viewport_width=900,
+                    viewport_height=1200,
+                    full_page=True,
+                )
 
-            # Space before email render block
-            y -= 0.5 * inch
+                # Space before email render block
+                y -= 0.5 * inch
 
-            min_readable_img_h = 4.25 * inch
+                min_readable_img_h = 4.25 * inch
 
-            y = _ensure_space(c, y, min_readable_img_h, height, margins)
+                y = _ensure_space(c, y, min_readable_img_h, height, margins)
 
-            y = _draw_email_html_screenshot(
-                c,
-                png_path=html_png_path,
-                width=width,
-                height=height,
-                margins=margins,
-                start_y=y
-            )
+                y = _draw_email_html_screenshot(
+                    c,
+                    png_path=html_png_path,
+                    width=width,
+                    height=height,
+                    margins=margins,
+                    start_y=y
+                )
 
 
         # Space before email body block
