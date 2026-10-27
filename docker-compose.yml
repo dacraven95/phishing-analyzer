@@ -20,3 +20,4 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
       - ./phish_analyzer/config:/app/phish_analyzer/config
+      - ./phish_analyzer/yara_rules:/app/phish_analyzer/yara_rules
